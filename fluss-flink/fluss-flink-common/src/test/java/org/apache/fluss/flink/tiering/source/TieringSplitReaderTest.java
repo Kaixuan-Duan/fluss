@@ -24,6 +24,7 @@ import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.client.table.writer.TableWriter;
 import org.apache.fluss.client.table.writer.UpsertWriter;
 import org.apache.fluss.client.write.HashBucketAssigner;
+import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.flink.tiering.TestingLakeTieringFactory;
 import org.apache.fluss.flink.tiering.TestingWriteResult;
 import org.apache.fluss.flink.tiering.source.metrics.TieringMetrics;
@@ -33,12 +34,14 @@ import org.apache.fluss.flink.tiering.source.split.TieringSplit;
 import org.apache.fluss.flink.utils.FlinkTestBase;
 import org.apache.fluss.lake.writer.LakeWriter;
 import org.apache.fluss.lake.writer.WriterInitContext;
+import org.apache.fluss.metadata.MergeEngineType;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.CompactedKeyEncoder;
+import org.apache.fluss.server.replica.Replica;
 
 import org.apache.flink.api.connector.source.SourceSplit;
 import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
@@ -332,6 +335,110 @@ class TieringSplitReaderTest extends FlinkTestBase {
             assertThat(writeResult).isNotNull();
             // expect null write result since no any records written
             assertThat(writeResult.writeResult()).isNull();
+        }
+    }
+
+    /**
+     * Regression test for <a href="https://github.com/apache/fluss/issues/2371">Issue #2371</a>:
+     * tiering service used to hang forever when the source table uses {@code first_row} merge
+     * engine and contains duplicate keys.
+     *
+     * <p>Root cause: when {@code MergeEngineType=FIRST_ROW} drops a duplicate upsert, the server
+     * still appends an "empty" WAL batch (recordCount=0) so the log offset advances. The client's
+     * {@code LogFetchCollector} previously only exposed buckets with non-empty record lists, so the
+     * {@link org.apache.fluss.client.table.scanner.log.ScanRecords} returned to {@code
+     * TieringSplitReader#forLogRecords} contained no entry for such buckets and the underlying
+     * {@code nextFetchOffset} was invisible to the tiering layer.
+     *
+     * <p>The fix exposes per-bucket {@code nextLogOffset} via {@code ScanRecords}, allowing {@code
+     * forLogRecords} to detect end-of-range even when only empty batches were observed.
+     */
+    @Test
+    void testTieringFirstRowMergeEngineFinishes() throws Exception {
+        TablePath tablePath = TablePath.of("fluss", "tiering_first_row_finish");
+        TableDescriptor descriptor =
+                TableDescriptor.builder()
+                        .schema(DEFAULT_PK_TABLE_SCHEMA)
+                        .distributedBy(DEFAULT_BUCKET_NUM, "id")
+                        .property(ConfigOptions.TABLE_MERGE_ENGINE, MergeEngineType.FIRST_ROW)
+                        .build();
+        long tableId = createTable(tablePath, descriptor);
+
+        // Write the same primary keys multiple times, flushing after EACH round so
+        // the writes hit the server as separate batches. Under FIRST_ROW only the
+        // first upsert per id produces a CDC record; subsequent writes for already
+        // existing keys become empty WAL batches that still bump the log offset.
+        int distinctKeys = 5;
+        int duplicatesPerKey = 10;
+        try (Table table = conn.getTable(tablePath)) {
+            for (int round = 0; round < duplicatesPerKey; round++) {
+                UpsertWriter writer = table.newUpsert().createWriter();
+                for (int id = 0; id < distinctKeys; id++) {
+                    writer.upsert(row(id, "v" + round));
+                }
+                writer.flush();
+            }
+        }
+
+        // Build log splits whose stoppingOffset equals the leader's current logEndOffset.
+        // For at least one bucket logEndOffset > number of CDC records, which is the
+        // condition that triggers the hang.
+        List<TieringSplit> logSplits = new ArrayList<>();
+        Set<String> splitIds = new HashSet<>();
+        long totalLogEndOffset = 0L;
+        for (int bucket = 0; bucket < DEFAULT_BUCKET_NUM; bucket++) {
+            TableBucket tb = new TableBucket(tableId, bucket);
+            Replica leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(tb);
+            long stoppingOffset = leader.getLogTablet().localLogEndOffset();
+            totalLogEndOffset += stoppingOffset;
+            if (stoppingOffset <= 0) {
+                continue;
+            }
+            TieringLogSplit split =
+                    createLogSplit(tablePath, tableId, bucket, EARLIEST_OFFSET, stoppingOffset);
+            logSplits.add(split);
+            splitIds.add(split.splitId());
+        }
+        assertThat(logSplits).isNotEmpty();
+        // Sanity-check the precondition for the bug: total log offsets across buckets
+        // must exceed the number of distinct-key CDC records, otherwise no empty
+        // batch was produced and the bug cannot manifest.
+        assertThat(totalLogEndOffset)
+                .as(
+                        "Expected logEndOffset (%d) to exceed distinctKeys (%d) so that "
+                                + "empty batches are produced under FIRST_ROW",
+                        totalLogEndOffset, distinctKeys)
+                .isGreaterThan(distinctKeys);
+
+        try (Connection connection =
+                        ConnectionFactory.createConnection(
+                                FLUSS_CLUSTER_EXTENSION.getClientConfig());
+                TieringSplitReader<TestingWriteResult> tieringSplitReader =
+                        createTieringReader(connection)) {
+            tieringSplitReader.handleSplitsChanges(new SplitsAddition<>(logSplits));
+
+            // Drive the reader. With the fix in place every split must finish within a
+            // few fetch rounds even though most polled batches are empty under FIRST_ROW.
+            Set<String> finished = new HashSet<>();
+            int maxRounds = 10;
+            for (int i = 0; i < maxRounds && !finished.containsAll(splitIds); i++) {
+                RecordsWithSplitIds<TableBucketWriteResult<TestingWriteResult>> fetchResult =
+                        tieringSplitReader.fetch();
+                finished.addAll(fetchResult.finishedSplits());
+                // drain the iterator so that the reader advances internal state
+                while (fetchResult.nextSplit() != null) {
+                    while (fetchResult.nextRecordFromSplit() != null) {
+                        // consume
+                    }
+                }
+            }
+
+            assertThat(finished)
+                    .as(
+                            "All tiering splits must finish under FIRST_ROW merge engine "
+                                    + "with duplicate keys (issue #2371). Finished: %s, expected: %s",
+                            finished, splitIds)
+                    .containsAll(splitIds);
         }
     }
 

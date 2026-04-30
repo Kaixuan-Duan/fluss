@@ -355,63 +355,87 @@ public class TieringSplitReader<WriteResult>
         Map<TableBucket, TableBucketWriteResult<WriteResult>> writeResults = new HashMap<>();
         Map<TableBucket, String> finishedSplitIds = new HashMap<>();
 
-        for (TableBucket bucket : scanRecords.buckets()) {
-            List<ScanRecord> bucketScanRecords = scanRecords.records(bucket);
-            if (bucketScanRecords.isEmpty()) {
-                continue;
-            }
+        // Iterate polledBuckets() (instead of buckets()) so that buckets which only produced
+        // empty WAL batches (e.g. duplicate upserts under the FIRST_ROW merge engine) are
+        // also visited. Otherwise the tiering service would loop forever on such buckets
+        // because their log offset has advanced but no ScanRecord materialized. See
+        // https://github.com/apache/fluss/issues/2371.
+        for (TableBucket bucket : scanRecords.polledBuckets()) {
             // no any stopping offset, just skip handle the records for the bucket
             Long stoppingOffset = currentTableStoppingOffsets.get(bucket);
             if (stoppingOffset == null) {
                 continue;
             }
+
+            List<ScanRecord> bucketScanRecords = scanRecords.records(bucket);
+            Long nextLogOffset = scanRecords.nextLogOffset(bucket);
             LakeWriter<WriteResult> lakeWriter = null;
-            for (ScanRecord record : bucketScanRecords) {
-                // if record is less than stopping offset
-                if (record.logOffset() < stoppingOffset) {
-                    if (lakeWriter == null) {
-                        lakeWriter =
-                                getOrCreateLakeWriter(
-                                        bucket,
-                                        currentTableSplitsByBucket.get(bucket).getPartitionName());
-                    }
-                    lakeWriter.write(record);
-                    if (record.getSizeInBytes() > 0) {
-                        tieringMetrics.recordBytesRead(record.getSizeInBytes());
+
+            if (!bucketScanRecords.isEmpty()) {
+                for (ScanRecord record : bucketScanRecords) {
+                    // if record is less than stopping offset
+                    if (record.logOffset() < stoppingOffset) {
+                        if (lakeWriter == null) {
+                            lakeWriter =
+                                    getOrCreateLakeWriter(
+                                            bucket,
+                                            currentTableSplitsByBucket.get(bucket).getPartitionName());
+                        }
+                        lakeWriter.write(record);
+                        if (record.getSizeInBytes() > 0) {
+                            tieringMetrics.recordBytesRead(record.getSizeInBytes());
+                        }
                     }
                 }
+                ScanRecord lastRecord = bucketScanRecords.get(bucketScanRecords.size() - 1);
+                currentTableTieredOffsetAndTimestamp.put(
+                        bucket,
+                        new LogOffsetAndTimestamp(lastRecord.logOffset(), lastRecord.timestamp()));
             }
-            ScanRecord lastRecord = bucketScanRecords.get(bucketScanRecords.size() - 1);
-            currentTableTieredOffsetAndTimestamp.put(
+
+            // Decide whether the split has reached its end. Prefer the scanner-reported
+            // nextLogOffset because it advances even when the bucket only produced empty
+            // batches; fall back to the last record offset for backwards compatibility.
+            boolean reachedEnd;
+            if (nextLogOffset != null) {
+                reachedEnd = nextLogOffset >= stoppingOffset;
+            } else if (!bucketScanRecords.isEmpty()) {
+                ScanRecord lastRecord = bucketScanRecords.get(bucketScanRecords.size() - 1);
+                reachedEnd = lastRecord.logOffset() >= stoppingOffset - 1;
+            } else {
+                reachedEnd = false;
+            }
+            if (!reachedEnd) {
+                continue;
+            }
+
+            currentTableStoppingOffsets.remove(bucket);
+            if (bucket.getPartitionId() != null) {
+                currentLogScanner.unsubscribe(bucket.getPartitionId(), bucket.getBucket());
+            } else {
+                // todo: should unsubscribe the log split if unsubscribe bucket for
+                // un-partitioned table is supported
+            }
+            TieringSplit currentTieringSplit = currentTableSplitsByBucket.remove(bucket);
+            String currentSplitId = currentTieringSplit.splitId();
+            // Use the latest known record timestamp for the bucket; fall back to
+            // UNKNOWN_BUCKET_TIMESTAMP when the split only contained empty batches and we
+            // never observed a real record.
+            LogOffsetAndTimestamp latest = currentTableTieredOffsetAndTimestamp.get(bucket);
+            long finishTimestamp = latest != null ? latest.timestamp : UNKNOWN_BUCKET_TIMESTAMP;
+            writeResults.put(
                     bucket,
-                    new LogOffsetAndTimestamp(lastRecord.logOffset(), lastRecord.timestamp()));
-            // has arrived into the end of the split,
-            if (lastRecord.logOffset() >= stoppingOffset - 1) {
-                currentTableStoppingOffsets.remove(bucket);
-                if (bucket.getPartitionId() != null) {
-                    currentLogScanner.unsubscribe(bucket.getPartitionId(), bucket.getBucket());
-                } else {
-                    // todo: should unsubscribe the log split if unsubscribe bucket for
-                    // un-partitioned table is supported
-                }
-                TieringSplit currentTieringSplit = currentTableSplitsByBucket.remove(bucket);
-                String currentSplitId = currentTieringSplit.splitId();
-                // put write result of the bucket
-                writeResults.put(
-                        bucket,
-                        completeLakeWriter(
-                                bucket,
-                                currentTieringSplit.getPartitionName(),
-                                stoppingOffset,
-                                lastRecord.timestamp()));
-                // put split of the bucket
-                finishedSplitIds.put(bucket, currentSplitId);
-                LOG.info(
-                        "Finish tier bucket {} for table {}, split: {}.",
-                        bucket,
-                        currentTablePath,
-                        currentSplitId);
-            }
+                    completeLakeWriter(
+                            bucket,
+                            currentTieringSplit.getPartitionName(),
+                            stoppingOffset,
+                            finishTimestamp));
+            finishedSplitIds.put(bucket, currentSplitId);
+            LOG.info(
+                    "Finish tier bucket {} for table {}, split: {}.",
+                    bucket,
+                    currentTablePath,
+                    currentSplitId);
         }
 
         if (!finishedSplitIds.isEmpty()) {

@@ -25,6 +25,8 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -56,5 +58,51 @@ public class ScanRecordsTest {
             assertThat(record.logOffset()).isEqualTo(c);
         }
         assertThat(c).isEqualTo(4);
+    }
+
+    /** Verifies the legacy single-arg constructor leaves {@code nextLogOffset} undefined. */
+    @Test
+    void legacyConstructorHasNoNextLogOffset() {
+        TableBucket tb = new TableBucket(0L, 0);
+        Map<TableBucket, List<ScanRecord>> records = new HashMap<>();
+        records.put(tb, Collections.emptyList());
+
+        ScanRecords scanRecords = new ScanRecords(records);
+
+        assertThat(scanRecords.buckets()).containsExactly(tb);
+        assertThat(scanRecords.polledBuckets()).containsExactly(tb);
+        assertThat(scanRecords.nextLogOffset(tb)).isNull();
+    }
+
+    /**
+     * Verifies that buckets which only produced empty WAL batches (no {@link ScanRecord}) are
+     * exposed via {@link ScanRecords#polledBuckets()} and {@link ScanRecords#nextLogOffset}, while
+     * the legacy {@link ScanRecords#buckets()} keeps its old semantics. This is the API surface
+     * relied on by the tiering service to fix issue #2371.
+     */
+    @Test
+    void emptyBucketIsExposedViaPolledBuckets() {
+        TableBucket bucketWithRecords = new TableBucket(0L, 0);
+        TableBucket emptyBucket = new TableBucket(0L, 1);
+
+        Map<TableBucket, List<ScanRecord>> records = new HashMap<>();
+        records.put(
+                bucketWithRecords,
+                Collections.singletonList(
+                        new ScanRecord(5L, 1000L, ChangeType.INSERT, row(1, "a"))));
+
+        Map<TableBucket, Long> nextOffsets = new HashMap<>();
+        nextOffsets.put(bucketWithRecords, 6L);
+        nextOffsets.put(emptyBucket, 10L);
+
+        ScanRecords scanRecords = new ScanRecords(records, nextOffsets);
+
+        assertThat(scanRecords.buckets()).containsExactly(bucketWithRecords);
+        assertThat(scanRecords.polledBuckets())
+                .containsExactlyInAnyOrder(bucketWithRecords, emptyBucket);
+        assertThat(scanRecords.records(emptyBucket)).isEmpty();
+        assertThat(scanRecords.nextLogOffset(bucketWithRecords)).isEqualTo(6L);
+        assertThat(scanRecords.nextLogOffset(emptyBucket)).isEqualTo(10L);
+        assertThat(scanRecords.nextLogOffset(new TableBucket(0L, 99))).isNull();
     }
 }

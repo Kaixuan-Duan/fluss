@@ -85,6 +85,11 @@ public class LogFetchCollector {
      */
     public ScanRecords collectFetch(final LogFetchBuffer logFetchBuffer) {
         Map<TableBucket, List<ScanRecord>> fetched = new HashMap<>();
+        // Tracks the next fetch offset for every bucket polled in this round, even when the
+        // returned record list is empty (e.g. empty WAL batches produced by the FIRST_ROW
+        // merge engine, see issue #2371). This lets callers (such as the tiering service)
+        // detect that the log offset has advanced past empty batches.
+        Map<TableBucket, Long> nextOffsets = new HashMap<>();
         int recordsRemaining = maxPollRecords;
 
         try {
@@ -120,8 +125,11 @@ public class LogFetchCollector {
                     logFetchBuffer.poll();
                 } else {
                     List<ScanRecord> records = fetchRecords(nextInLineFetch, recordsRemaining);
+                    TableBucket tableBucket = nextInLineFetch.tableBucket;
+                    // Always record the advanced next fetch offset for this bucket, even when
+                    // the materialized record list is empty.
+                    nextOffsets.put(tableBucket, nextInLineFetch.nextFetchOffset());
                     if (!records.isEmpty()) {
-                        TableBucket tableBucket = nextInLineFetch.tableBucket;
                         List<ScanRecord> currentRecords = fetched.get(tableBucket);
                         if (currentRecords == null) {
                             fetched.put(tableBucket, records);
@@ -147,7 +155,7 @@ public class LogFetchCollector {
             }
         }
 
-        return new ScanRecords(fetched);
+        return new ScanRecords(fetched, nextOffsets);
     }
 
     private List<ScanRecord> fetchRecords(CompletedFetch nextInLineFetch, int maxRecords) {
