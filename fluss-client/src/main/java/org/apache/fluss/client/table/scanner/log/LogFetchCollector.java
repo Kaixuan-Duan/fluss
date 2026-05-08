@@ -77,9 +77,15 @@ public class LogFetchCollector {
     /**
      * Return the fetched log records, empty the record buffer and update the consumed position.
      *
-     * <p>NOTE: returning empty records guarantees the consumed position are NOT updated.
+     * <p>The returned {@link ScanRecords#records(TableBucket)} may be empty for a bucket even when
+     * the consumed position was advanced — e.g. when a {@link LogRecordBatch} is fully filtered out
+     * or when the FIRST_ROW merge engine emits empty WAL batches. In such cases the next fetch
+     * offset is still surfaced via {@link ScanRecords#nextLogOffset(TableBucket)} so that callers
+     * (e.g. the tiering service) can detect end-of-range based on offset progress alone. See <a
+     * href="https://github.com/apache/fluss/issues/2371">FLUSS-2371</a>.
      *
-     * @return The fetched records per partition
+     * @return The fetched records per partition, plus the next log offset for every bucket polled
+     *     in this round.
      * @throws LogOffsetOutOfRangeException If there is OffsetOutOfRange error in fetchResponse and
      *     the defaultResetPolicy is NONE
      */

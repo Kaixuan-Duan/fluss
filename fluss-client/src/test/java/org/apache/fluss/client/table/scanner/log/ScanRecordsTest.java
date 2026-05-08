@@ -105,4 +105,34 @@ public class ScanRecordsTest {
         assertThat(scanRecords.nextLogOffset(emptyBucket)).isEqualTo(10L);
         assertThat(scanRecords.nextLogOffset(new TableBucket(0L, 99))).isNull();
     }
+
+    /**
+     * Verifies that {@link ScanRecords#isEmpty()} treats a "progress-only" poll round (no
+     * materialized records but advanced {@code nextLogOffset}) as non-empty, so that {@link
+     * LogScannerImpl#poll} does not block in {@code awaitNotEmpty} and discard the offset progress
+     * (regression guard for issue #2371).
+     */
+    @Test
+    void isEmptyConsidersAdvancedNextLogOffsets() {
+        TableBucket tb = new TableBucket(0L, 0);
+
+        // Both records and nextLogOffsets are empty -> truly empty.
+        ScanRecords trulyEmpty = ScanRecords.EMPTY;
+        assertThat(trulyEmpty.isEmpty()).isTrue();
+
+        // Records empty, but a bucket advanced its next fetch offset -> NOT empty.
+        Map<TableBucket, Long> progressOnly = new HashMap<>();
+        progressOnly.put(tb, 42L);
+        ScanRecords progressOnlyRecords = new ScanRecords(Collections.emptyMap(), progressOnly);
+        assertThat(progressOnlyRecords.isEmpty()).isFalse();
+
+        // Records non-empty -> NOT empty (legacy behaviour preserved).
+        Map<TableBucket, List<ScanRecord>> records = new HashMap<>();
+        records.put(
+                tb,
+                Collections.singletonList(
+                        new ScanRecord(0L, 1000L, ChangeType.INSERT, row(1, "a"))));
+        ScanRecords withRecords = new ScanRecords(records);
+        assertThat(withRecords.isEmpty()).isFalse();
+    }
 }
