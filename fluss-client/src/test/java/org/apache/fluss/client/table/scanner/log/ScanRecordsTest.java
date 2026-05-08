@@ -107,26 +107,32 @@ public class ScanRecordsTest {
     }
 
     /**
-     * Verifies that {@link ScanRecords#isEmpty()} treats a "progress-only" poll round (no
-     * materialized records but advanced {@code nextLogOffset}) as non-empty, so that {@link
-     * LogScannerImpl#poll} does not block in {@code awaitNotEmpty} and discard the offset progress
-     * (regression guard for issue #2371).
+     * Verifies that {@link ScanRecords#isEmpty()} reflects only whether materialized records are
+     * present, regardless of advanced {@code nextLogOffsets}. The "progress-only" gating used by
+     * {@link LogScannerImpl#poll} (regression guard for issue #2371) is built on top of {@link
+     * ScanRecords#polledBuckets()} instead, so the public {@code isEmpty()} contract stays
+     * compatible with callers that treat empty as "no records to consume".
      */
     @Test
-    void isEmptyConsidersAdvancedNextLogOffsets() {
+    void isEmptyReflectsOnlyMaterializedRecords() {
         TableBucket tb = new TableBucket(0L, 0);
 
-        // Both records and nextLogOffsets are empty -> truly empty.
+        // Both records and nextLogOffsets are empty -> empty.
         ScanRecords trulyEmpty = ScanRecords.EMPTY;
         assertThat(trulyEmpty.isEmpty()).isTrue();
+        assertThat(trulyEmpty.polledBuckets()).isEmpty();
 
-        // Records empty, but a bucket advanced its next fetch offset -> NOT empty.
+        // Records empty, but a bucket advanced its next fetch offset -> still isEmpty(),
+        // but polledBuckets() must surface the advanced bucket so LogScannerImpl can
+        // forward the progress to its caller.
         Map<TableBucket, Long> progressOnly = new HashMap<>();
         progressOnly.put(tb, 42L);
         ScanRecords progressOnlyRecords = new ScanRecords(Collections.emptyMap(), progressOnly);
-        assertThat(progressOnlyRecords.isEmpty()).isFalse();
+        assertThat(progressOnlyRecords.isEmpty()).isTrue();
+        assertThat(progressOnlyRecords.polledBuckets()).containsExactly(tb);
+        assertThat(progressOnlyRecords.nextLogOffset(tb)).isEqualTo(42L);
 
-        // Records non-empty -> NOT empty (legacy behaviour preserved).
+        // Records non-empty -> NOT empty.
         Map<TableBucket, List<ScanRecord>> records = new HashMap<>();
         records.put(
                 tb,
@@ -134,5 +140,6 @@ public class ScanRecordsTest {
                         new ScanRecord(0L, 1000L, ChangeType.INSERT, row(1, "a"))));
         ScanRecords withRecords = new ScanRecords(records);
         assertThat(withRecords.isEmpty()).isFalse();
+        assertThat(withRecords.polledBuckets()).containsExactly(tb);
     }
 }

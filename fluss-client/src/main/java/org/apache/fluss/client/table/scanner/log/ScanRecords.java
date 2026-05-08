@@ -127,19 +127,9 @@ public class ScanRecords implements Iterable<ScanRecord> {
         return count;
     }
 
-    /**
-     * Returns {@code true} if this {@code ScanRecords} carries neither materialized records nor any
-     * advanced {@code nextLogOffset} information.
-     *
-     * <p>Note that a poll round can make progress (advance the next fetch offset for a bucket)
-     * without producing any {@link ScanRecord}, e.g. when the FIRST_ROW merge engine emits empty
-     * WAL batches because the upserted key already exists. Such "progress-only" results are
-     * intentionally NOT considered empty so that callers gating on {@code isEmpty()} (e.g. {@link
-     * LogScanner#poll}) do not discard the {@code nextLogOffset} information and re-introduce the
-     * tiering hang fixed by <a href="https://github.com/apache/fluss/issues/2371">FLUSS-2371</a>.
-     */
+    /** Returns {@code true} if this {@code ScanRecords} contains no materialized records. */
     public boolean isEmpty() {
-        return records.isEmpty() && nextLogOffsets.isEmpty();
+        return records.isEmpty();
     }
 
     @Override

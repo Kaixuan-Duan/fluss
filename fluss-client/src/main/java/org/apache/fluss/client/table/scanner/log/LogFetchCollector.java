@@ -84,6 +84,11 @@ public class LogFetchCollector {
      * (e.g. the tiering service) can detect end-of-range based on offset progress alone. See <a
      * href="https://github.com/apache/fluss/issues/2371">FLUSS-2371</a>.
      *
+     * <p>Note that {@link ScanRecords#isEmpty()} only reflects whether any materialized records
+     * were produced and does NOT account for such progress-only rounds. Callers that need to detect
+     * offset progress should use {@link ScanRecords#polledBuckets()} or {@link
+     * ScanRecords#nextLogOffset(TableBucket)} instead.
+     *
      * @return The fetched records per partition, plus the next log offset for every bucket polled
      *     in this round.
      * @throws LogOffsetOutOfRangeException If there is OffsetOutOfRange error in fetchResponse and
