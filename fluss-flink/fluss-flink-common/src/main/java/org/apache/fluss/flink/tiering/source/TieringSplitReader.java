@@ -355,12 +355,8 @@ public class TieringSplitReader<WriteResult>
         Map<TableBucket, TableBucketWriteResult<WriteResult>> writeResults = new HashMap<>();
         Map<TableBucket, String> finishedSplitIds = new HashMap<>();
 
-        // Iterate polledBuckets() (instead of buckets()) so that buckets which only produced
-        // empty WAL batches (e.g. duplicate upserts under the FIRST_ROW merge engine) are
-        // also visited. Otherwise the tiering service would loop forever on such buckets
-        // because their log offset has advanced but no ScanRecord materialized. See
-        // https://github.com/apache/fluss/issues/2371.
-        for (TableBucket bucket : scanRecords.polledBuckets()) {
+        // Iterate every polled bucket, including those that only advanced their offset.
+        for (TableBucket bucket : scanRecords.buckets()) {
             // no any stopping offset, just skip handle the records for the bucket
             Long stoppingOffset = currentTableStoppingOffsets.get(bucket);
             if (stoppingOffset == null) {
@@ -368,18 +364,20 @@ public class TieringSplitReader<WriteResult>
             }
 
             List<ScanRecord> bucketScanRecords = scanRecords.records(bucket);
-            Long nextLogOffset = scanRecords.nextLogOffset(bucket);
+            ScanRecord lastRecord = null;
             LakeWriter<WriteResult> lakeWriter = null;
 
             if (!bucketScanRecords.isEmpty()) {
                 for (ScanRecord record : bucketScanRecords) {
-                    // if record is less than stopping offset
+                    // only tier records within the split range [start, stoppingOffset).
                     if (record.logOffset() < stoppingOffset) {
                         if (lakeWriter == null) {
                             lakeWriter =
                                     getOrCreateLakeWriter(
                                             bucket,
-                                            currentTableSplitsByBucket.get(bucket).getPartitionName());
+                                            currentTableSplitsByBucket
+                                                    .get(bucket)
+                                                    .getPartitionName());
                         }
                         lakeWriter.write(record);
                         if (record.getSizeInBytes() > 0) {
@@ -387,24 +385,33 @@ public class TieringSplitReader<WriteResult>
                         }
                     }
                 }
-                ScanRecord lastRecord = bucketScanRecords.get(bucketScanRecords.size() - 1);
-                currentTableTieredOffsetAndTimestamp.put(
-                        bucket,
-                        new LogOffsetAndTimestamp(lastRecord.logOffset(), lastRecord.timestamp()));
+                lastRecord = bucketScanRecords.get(bucketScanRecords.size() - 1);
             }
 
-            // Decide whether the split has reached its end. Prefer the scanner-reported
-            // nextLogOffset because it advances even when the bucket only produced empty
-            // batches; fall back to the last record offset for backwards compatibility.
-            boolean reachedEnd;
-            if (nextLogOffset != null) {
-                reachedEnd = nextLogOffset >= stoppingOffset;
-            } else if (!bucketScanRecords.isEmpty()) {
-                ScanRecord lastRecord = bucketScanRecords.get(bucketScanRecords.size() - 1);
-                reachedEnd = lastRecord.logOffset() >= stoppingOffset - 1;
-            } else {
-                reachedEnd = false;
+            // Prefer the scanner-reported lastConsumedOffset; fall back to the last record offset.
+            Long lastConsumedOffset = scanRecords.lastConsumedOffset(bucket);
+            boolean reachedEnd =
+                    lastConsumedOffset != null
+                            ? lastConsumedOffset >= stoppingOffset
+                            : lastRecord != null && lastRecord.logOffset() >= stoppingOffset - 1;
+
+            if (!reachedEnd && lastRecord == null) {
+                continue;
             }
+
+            // When reachedEnd, the tiered offset is stoppingOffset - 1 (exclusive bound).
+            // Timestamp prefers the current record, then the previously tracked value.
+            long tieredOffset = reachedEnd ? stoppingOffset - 1 : lastRecord.logOffset();
+            long tieredTimestamp;
+            if (lastRecord != null) {
+                tieredTimestamp = lastRecord.timestamp();
+            } else {
+                LogOffsetAndTimestamp latest = currentTableTieredOffsetAndTimestamp.get(bucket);
+                tieredTimestamp = latest != null ? latest.timestamp : UNKNOWN_BUCKET_TIMESTAMP;
+            }
+            currentTableTieredOffsetAndTimestamp.put(
+                    bucket, new LogOffsetAndTimestamp(tieredOffset, tieredTimestamp));
+
             if (!reachedEnd) {
                 continue;
             }
@@ -418,18 +425,13 @@ public class TieringSplitReader<WriteResult>
             }
             TieringSplit currentTieringSplit = currentTableSplitsByBucket.remove(bucket);
             String currentSplitId = currentTieringSplit.splitId();
-            // Use the latest known record timestamp for the bucket; fall back to
-            // UNKNOWN_BUCKET_TIMESTAMP when the split only contained empty batches and we
-            // never observed a real record.
-            LogOffsetAndTimestamp latest = currentTableTieredOffsetAndTimestamp.get(bucket);
-            long finishTimestamp = latest != null ? latest.timestamp : UNKNOWN_BUCKET_TIMESTAMP;
             writeResults.put(
                     bucket,
                     completeLakeWriter(
                             bucket,
                             currentTieringSplit.getPartitionName(),
                             stoppingOffset,
-                            finishTimestamp));
+                            tieredTimestamp));
             finishedSplitIds.put(bucket, currentSplitId);
             LOG.info(
                     "Finish tier bucket {} for table {}, split: {}.",

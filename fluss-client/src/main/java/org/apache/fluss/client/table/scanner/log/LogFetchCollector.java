@@ -77,30 +77,13 @@ public class LogFetchCollector {
     /**
      * Return the fetched log records, empty the record buffer and update the consumed position.
      *
-     * <p>The returned {@link ScanRecords#records(TableBucket)} may be empty for a bucket even when
-     * the consumed position was advanced — e.g. when a {@link LogRecordBatch} is fully filtered out
-     * or when the FIRST_ROW merge engine emits empty WAL batches. In such cases the next fetch
-     * offset is still surfaced via {@link ScanRecords#nextLogOffset(TableBucket)} so that callers
-     * (e.g. the tiering service) can detect end-of-range based on offset progress alone. See <a
-     * href="https://github.com/apache/fluss/issues/2371">FLUSS-2371</a>.
-     *
-     * <p>Note that {@link ScanRecords#isEmpty()} only reflects whether any materialized records
-     * were produced and does NOT account for such progress-only rounds. Callers that need to detect
-     * offset progress should use {@link ScanRecords#polledBuckets()} or {@link
-     * ScanRecords#nextLogOffset(TableBucket)} instead.
-     *
-     * @return The fetched records per partition, plus the next log offset for every bucket polled
-     *     in this round.
+     * @return The fetched records per partition
      * @throws LogOffsetOutOfRangeException If there is OffsetOutOfRange error in fetchResponse and
      *     the defaultResetPolicy is NONE
      */
     public ScanRecords collectFetch(final LogFetchBuffer logFetchBuffer) {
         Map<TableBucket, List<ScanRecord>> fetched = new HashMap<>();
-        // Tracks the next fetch offset for every bucket polled in this round, even when the
-        // returned record list is empty (e.g. empty WAL batches produced by the FIRST_ROW
-        // merge engine, see issue #2371). This lets callers (such as the tiering service)
-        // detect that the log offset has advanced past empty batches.
-        Map<TableBucket, Long> nextOffsets = new HashMap<>();
+        Map<TableBucket, Long> lastConsumedOffsets = new HashMap<>();
         int recordsRemaining = maxPollRecords;
 
         try {
@@ -139,7 +122,7 @@ public class LogFetchCollector {
                     TableBucket tableBucket = nextInLineFetch.tableBucket;
                     // Always record the advanced next fetch offset for this bucket, even when
                     // the materialized record list is empty.
-                    nextOffsets.put(tableBucket, nextInLineFetch.nextFetchOffset());
+                    lastConsumedOffsets.put(tableBucket, nextInLineFetch.nextFetchOffset());
                     if (!records.isEmpty()) {
                         List<ScanRecord> currentRecords = fetched.get(tableBucket);
                         if (currentRecords == null) {
@@ -166,7 +149,11 @@ public class LogFetchCollector {
             }
         }
 
-        return new ScanRecords(fetched, nextOffsets);
+        // Ensure every polled bucket appears in fetched so that buckets() reflects the polled set.
+        for (TableBucket polled : lastConsumedOffsets.keySet()) {
+            fetched.putIfAbsent(polled, Collections.emptyList());
+        }
+        return new ScanRecords(fetched, lastConsumedOffsets);
     }
 
     private List<ScanRecord> fetchRecords(CompletedFetch nextInLineFetch, int maxRecords) {

@@ -142,12 +142,8 @@ public class LogScannerImpl implements LogScanner {
             long startNanos = System.nanoTime();
             do {
                 ScanRecords scanRecords = pollForFetches();
-                // Gate on polledBuckets() (records OR advanced nextLogOffsets) rather than
-                // isEmpty() so that a "progress-only" poll round (e.g. empty WAL batches
-                // produced by the FIRST_ROW merge engine, see FLUSS-2371) is surfaced to the
-                // caller instead of being discarded here, which would drop the nextLogOffset
-                // information and re-introduce the tiering hang.
-                if (scanRecords.polledBuckets().isEmpty()) {
+                // Gate on buckets() rather than isEmpty() so progress-only polls reach the caller.
+                if (scanRecords.buckets().isEmpty()) {
                     try {
                         if (!logFetcher.awaitNotEmpty(startNanos + timeoutNanos)) {
                             // logFetcher waits for the timeout and no data in buffer,
@@ -254,10 +250,8 @@ public class LogScannerImpl implements LogScanner {
 
     private ScanRecords pollForFetches() {
         ScanRecords scanRecords = logFetcher.collectFetch();
-        // Check polledBuckets() instead of isEmpty() so a progress-only poll (advanced
-        // nextLogOffsets with no materialized records) is returned to the caller rather
-        // than being re-collected, which would drop the nextLogOffset information.
-        if (!scanRecords.polledBuckets().isEmpty()) {
+        // Check buckets() (includes progress-only buckets).
+        if (!scanRecords.buckets().isEmpty()) {
             return scanRecords;
         }
 

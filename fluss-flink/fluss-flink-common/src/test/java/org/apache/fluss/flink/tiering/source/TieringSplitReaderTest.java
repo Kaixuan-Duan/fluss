@@ -339,19 +339,8 @@ class TieringSplitReaderTest extends FlinkTestBase {
     }
 
     /**
-     * Regression test for <a href="https://github.com/apache/fluss/issues/2371">Issue #2371</a>:
-     * tiering service used to hang forever when the source table uses {@code first_row} merge
-     * engine and contains duplicate keys.
-     *
-     * <p>Root cause: when {@code MergeEngineType=FIRST_ROW} drops a duplicate upsert, the server
-     * still appends an "empty" WAL batch (recordCount=0) so the log offset advances. The client's
-     * {@code LogFetchCollector} previously only exposed buckets with non-empty record lists, so the
-     * {@link org.apache.fluss.client.table.scanner.log.ScanRecords} returned to {@code
-     * TieringSplitReader#forLogRecords} contained no entry for such buckets and the underlying
-     * {@code nextFetchOffset} was invisible to the tiering layer.
-     *
-     * <p>The fix exposes per-bucket {@code nextLogOffset} via {@code ScanRecords}, allowing {@code
-     * forLogRecords} to detect end-of-range even when only empty batches were observed.
+     * Verifies that the tiering service finishes under {@code first_row} merge engine even when
+     * duplicate upserts produce empty WAL batches.
      */
     @Test
     void testTieringFirstRowMergeEngineFinishes() throws Exception {
@@ -364,10 +353,8 @@ class TieringSplitReaderTest extends FlinkTestBase {
                         .build();
         long tableId = createTable(tablePath, descriptor);
 
-        // Write the same primary keys multiple times, flushing after EACH round so
-        // the writes hit the server as separate batches. Under FIRST_ROW only the
-        // first upsert per id produces a CDC record; subsequent writes for already
-        // existing keys become empty WAL batches that still bump the log offset.
+        // Duplicate upserts under FIRST_ROW: only the first per id yields a CDC
+        // record, the rest become empty WAL batches that still advance the offset.
         int distinctKeys = 5;
         int duplicatesPerKey = 10;
         try (Table table = conn.getTable(tablePath)) {
@@ -381,8 +368,6 @@ class TieringSplitReaderTest extends FlinkTestBase {
         }
 
         // Build log splits whose stoppingOffset equals the leader's current logEndOffset.
-        // For at least one bucket logEndOffset > number of CDC records, which is the
-        // condition that triggers the hang.
         List<TieringSplit> logSplits = new ArrayList<>();
         Set<String> splitIds = new HashSet<>();
         long totalLogEndOffset = 0L;
@@ -400,9 +385,8 @@ class TieringSplitReaderTest extends FlinkTestBase {
             splitIds.add(split.splitId());
         }
         assertThat(logSplits).isNotEmpty();
-        // Sanity-check the precondition for the bug: total log offsets across buckets
-        // must exceed the number of distinct-key CDC records, otherwise no empty
-        // batch was produced and the bug cannot manifest.
+        // Pre-condition: total log offsets must exceed distinct-key count, otherwise
+        // no empty batch was produced.
         assertThat(totalLogEndOffset)
                 .as(
                         "Expected logEndOffset (%d) to exceed distinctKeys (%d) so that "
@@ -417,8 +401,7 @@ class TieringSplitReaderTest extends FlinkTestBase {
                         createTieringReader(connection)) {
             tieringSplitReader.handleSplitsChanges(new SplitsAddition<>(logSplits));
 
-            // Drive the reader. With the fix in place every split must finish within a
-            // few fetch rounds even though most polled batches are empty under FIRST_ROW.
+            // With the fix every split must finish within a few fetch rounds.
             Set<String> finished = new HashSet<>();
             int maxRounds = 10;
             for (int i = 0; i < maxRounds && !finished.containsAll(splitIds); i++) {
@@ -436,7 +419,7 @@ class TieringSplitReaderTest extends FlinkTestBase {
             assertThat(finished)
                     .as(
                             "All tiering splits must finish under FIRST_ROW merge engine "
-                                    + "with duplicate keys (issue #2371). Finished: %s, expected: %s",
+                                    + "with duplicate keys. Finished: %s, expected: %s",
                             finished, splitIds)
                     .containsAll(splitIds);
         }

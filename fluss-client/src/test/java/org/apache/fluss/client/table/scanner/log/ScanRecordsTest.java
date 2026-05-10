@@ -60,9 +60,9 @@ public class ScanRecordsTest {
         assertThat(c).isEqualTo(4);
     }
 
-    /** Verifies the legacy single-arg constructor leaves {@code nextLogOffset} undefined. */
+    /** Verifies the legacy single-arg constructor leaves {@code lastConsumedOffset} undefined. */
     @Test
-    void legacyConstructorHasNoNextLogOffset() {
+    void legacyConstructorHasNoLastConsumedOffset() {
         TableBucket tb = new TableBucket(0L, 0);
         Map<TableBucket, List<ScanRecord>> records = new HashMap<>();
         records.put(tb, Collections.emptyList());
@@ -70,18 +70,15 @@ public class ScanRecordsTest {
         ScanRecords scanRecords = new ScanRecords(records);
 
         assertThat(scanRecords.buckets()).containsExactly(tb);
-        assertThat(scanRecords.polledBuckets()).containsExactly(tb);
-        assertThat(scanRecords.nextLogOffset(tb)).isNull();
+        assertThat(scanRecords.lastConsumedOffset(tb)).isNull();
     }
 
     /**
-     * Verifies that buckets which only produced empty WAL batches (no {@link ScanRecord}) are
-     * exposed via {@link ScanRecords#polledBuckets()} and {@link ScanRecords#nextLogOffset}, while
-     * the legacy {@link ScanRecords#buckets()} keeps its old semantics. This is the API surface
-     * relied on by the tiering service to fix issue #2371.
+     * Verifies buckets with only advanced offsets are still exposed via {@link
+     * ScanRecords#buckets()} and carry their {@code lastConsumedOffset}.
      */
     @Test
-    void emptyBucketIsExposedViaPolledBuckets() {
+    void emptyBucketIsExposedViaBuckets() {
         TableBucket bucketWithRecords = new TableBucket(0L, 0);
         TableBucket emptyBucket = new TableBucket(0L, 1);
 
@@ -90,49 +87,48 @@ public class ScanRecordsTest {
                 bucketWithRecords,
                 Collections.singletonList(
                         new ScanRecord(5L, 1000L, ChangeType.INSERT, row(1, "a"))));
+        // Empty-progress buckets also appear in records (as emptyList).
+        records.put(emptyBucket, Collections.emptyList());
 
-        Map<TableBucket, Long> nextOffsets = new HashMap<>();
-        nextOffsets.put(bucketWithRecords, 6L);
-        nextOffsets.put(emptyBucket, 10L);
+        Map<TableBucket, Long> lastConsumedOffsets = new HashMap<>();
+        lastConsumedOffsets.put(bucketWithRecords, 6L);
+        lastConsumedOffsets.put(emptyBucket, 10L);
 
-        ScanRecords scanRecords = new ScanRecords(records, nextOffsets);
+        ScanRecords scanRecords = new ScanRecords(records, lastConsumedOffsets);
 
-        assertThat(scanRecords.buckets()).containsExactly(bucketWithRecords);
-        assertThat(scanRecords.polledBuckets())
-                .containsExactlyInAnyOrder(bucketWithRecords, emptyBucket);
+        assertThat(scanRecords.buckets()).containsExactlyInAnyOrder(bucketWithRecords, emptyBucket);
         assertThat(scanRecords.records(emptyBucket)).isEmpty();
-        assertThat(scanRecords.nextLogOffset(bucketWithRecords)).isEqualTo(6L);
-        assertThat(scanRecords.nextLogOffset(emptyBucket)).isEqualTo(10L);
-        assertThat(scanRecords.nextLogOffset(new TableBucket(0L, 99))).isNull();
+        assertThat(scanRecords.lastConsumedOffset(bucketWithRecords)).isEqualTo(6L);
+        assertThat(scanRecords.lastConsumedOffset(emptyBucket)).isEqualTo(10L);
+        assertThat(scanRecords.lastConsumedOffset(new TableBucket(0L, 99))).isNull();
     }
 
     /**
-     * Verifies that {@link ScanRecords#isEmpty()} reflects only whether materialized records are
-     * present, regardless of advanced {@code nextLogOffsets}. The "progress-only" gating used by
-     * {@link LogScannerImpl#poll} (regression guard for issue #2371) is built on top of {@link
-     * ScanRecords#polledBuckets()} instead, so the public {@code isEmpty()} contract stays
-     * compatible with callers that treat empty as "no records to consume".
+     * Verifies {@link ScanRecords#isEmpty()} reflects only materialized records, regardless of
+     * advanced offsets.
      */
     @Test
     void isEmptyReflectsOnlyMaterializedRecords() {
         TableBucket tb = new TableBucket(0L, 0);
 
-        // Both records and nextLogOffsets are empty -> empty.
+        // No records and no progress: both isEmpty() and buckets() must be empty.
         ScanRecords trulyEmpty = ScanRecords.EMPTY;
         assertThat(trulyEmpty.isEmpty()).isTrue();
-        assertThat(trulyEmpty.polledBuckets()).isEmpty();
+        assertThat(trulyEmpty.buckets()).isEmpty();
 
-        // Records empty, but a bucket advanced its next fetch offset -> still isEmpty(),
-        // but polledBuckets() must surface the advanced bucket so LogScannerImpl can
-        // forward the progress to its caller.
+        // Progress-only round: isEmpty() must stay true (no materialized records),
+        // while buckets() must still expose the advanced bucket for callers to detect.
+        Map<TableBucket, List<ScanRecord>> emptyRecords = new HashMap<>();
+        emptyRecords.put(tb, Collections.emptyList());
         Map<TableBucket, Long> progressOnly = new HashMap<>();
         progressOnly.put(tb, 42L);
-        ScanRecords progressOnlyRecords = new ScanRecords(Collections.emptyMap(), progressOnly);
+        ScanRecords progressOnlyRecords = new ScanRecords(emptyRecords, progressOnly);
         assertThat(progressOnlyRecords.isEmpty()).isTrue();
-        assertThat(progressOnlyRecords.polledBuckets()).containsExactly(tb);
-        assertThat(progressOnlyRecords.nextLogOffset(tb)).isEqualTo(42L);
+        assertThat(progressOnlyRecords.buckets()).containsExactly(tb);
+        assertThat(progressOnlyRecords.lastConsumedOffset(tb)).isEqualTo(42L);
 
-        // Records non-empty -> NOT empty.
+        // Materialized records present: isEmpty() flips to false; legacy single-arg ctor still
+        // works.
         Map<TableBucket, List<ScanRecord>> records = new HashMap<>();
         records.put(
                 tb,
@@ -140,6 +136,6 @@ public class ScanRecordsTest {
                         new ScanRecord(0L, 1000L, ChangeType.INSERT, row(1, "a"))));
         ScanRecords withRecords = new ScanRecords(records);
         assertThat(withRecords.isEmpty()).isFalse();
-        assertThat(withRecords.polledBuckets()).containsExactly(tb);
+        assertThat(withRecords.buckets()).containsExactly(tb);
     }
 }

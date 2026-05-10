@@ -258,12 +258,9 @@ public class LogFetchCollectorTest {
         assertThat(scanRecords.records(tb)).isEmpty();
         assertThat(logScannerStatus.getBucketOffset(tb)).isEqualTo(20L);
         assertThat(completedFetch.isConsumed()).isTrue();
-        // Although the materialized record list is empty, the bucket must be exposed
-        // through polledBuckets() with an advanced nextLogOffset so that batch readers
-        // (e.g. the tiering service) can detect end-of-range. See issue #2371.
-        assertThat(scanRecords.buckets()).doesNotContain(tb);
-        assertThat(scanRecords.polledBuckets()).contains(tb);
-        assertThat(scanRecords.nextLogOffset(tb)).isEqualTo(20L);
+        // Empty record list, but bucket exposed via buckets() with an advanced lastConsumedOffset.
+        assertThat(scanRecords.buckets()).contains(tb);
+        assertThat(scanRecords.lastConsumedOffset(tb)).isEqualTo(20L);
     }
 
     private DefaultCompletedFetch makeCompletedFetch(
