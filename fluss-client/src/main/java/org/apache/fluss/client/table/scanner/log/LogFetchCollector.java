@@ -83,7 +83,7 @@ public class LogFetchCollector {
      */
     public ScanRecords collectFetch(final LogFetchBuffer logFetchBuffer) {
         Map<TableBucket, List<ScanRecord>> fetched = new HashMap<>();
-        Map<TableBucket, Long> lastConsumedOffsets = new HashMap<>();
+        Map<TableBucket, Long> consumedUpToOffsets = new HashMap<>();
         int recordsRemaining = maxPollRecords;
 
         try {
@@ -122,7 +122,7 @@ public class LogFetchCollector {
                     TableBucket tableBucket = nextInLineFetch.tableBucket;
                     // Always record the advanced next fetch offset for this bucket, even when
                     // the materialized record list is empty.
-                    lastConsumedOffsets.put(tableBucket, nextInLineFetch.nextFetchOffset());
+                    consumedUpToOffsets.put(tableBucket, nextInLineFetch.nextFetchOffset());
                     if (!records.isEmpty()) {
                         List<ScanRecord> currentRecords = fetched.get(tableBucket);
                         if (currentRecords == null) {
@@ -140,6 +140,8 @@ public class LogFetchCollector {
                         }
 
                         recordsRemaining -= records.size();
+                    } else {
+                        fetched.putIfAbsent(tableBucket, Collections.emptyList());
                     }
                 }
             }
@@ -149,11 +151,7 @@ public class LogFetchCollector {
             }
         }
 
-        // Ensure every polled bucket appears in fetched so that buckets() reflects the polled set.
-        for (TableBucket polled : lastConsumedOffsets.keySet()) {
-            fetched.putIfAbsent(polled, Collections.emptyList());
-        }
-        return new ScanRecords(fetched, lastConsumedOffsets);
+        return new ScanRecords(fetched, consumedUpToOffsets);
     }
 
     private List<ScanRecord> fetchRecords(CompletedFetch nextInLineFetch, int maxRecords) {

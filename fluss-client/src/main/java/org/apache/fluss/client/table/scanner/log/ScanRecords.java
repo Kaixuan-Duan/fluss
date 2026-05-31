@@ -44,7 +44,7 @@ public class ScanRecords implements Iterable<ScanRecord> {
     private final Map<TableBucket, List<ScanRecord>> records;
 
     /** The exclusive upper bound of consumed offsets per polled bucket in this round. */
-    private final Map<TableBucket, Long> lastConsumedOffsets;
+    private final Map<TableBucket, Long> consumedUpToOffsets;
 
     public ScanRecords(Map<TableBucket, List<ScanRecord>> records) {
         this(records, Collections.emptyMap());
@@ -52,9 +52,9 @@ public class ScanRecords implements Iterable<ScanRecord> {
 
     public ScanRecords(
             Map<TableBucket, List<ScanRecord>> records,
-            Map<TableBucket, Long> lastConsumedOffsets) {
+            Map<TableBucket, Long> consumedUpToOffsets) {
         this.records = records;
-        this.lastConsumedOffsets = lastConsumedOffsets;
+        this.consumedUpToOffsets = consumedUpToOffsets;
     }
 
     /**
@@ -86,8 +86,8 @@ public class ScanRecords implements Iterable<ScanRecord> {
      *     this round
      */
     @Nullable
-    public Long lastConsumedOffset(TableBucket bucket) {
-        return lastConsumedOffsets.get(bucket);
+    public Long consumedUpToOffset(TableBucket bucket) {
+        return consumedUpToOffsets.get(bucket);
     }
 
     /** The number of records for all buckets. */

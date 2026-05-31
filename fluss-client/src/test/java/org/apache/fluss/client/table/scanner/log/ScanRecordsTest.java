@@ -60,55 +60,11 @@ public class ScanRecordsTest {
         assertThat(c).isEqualTo(4);
     }
 
-    /** Verifies the legacy single-arg constructor leaves {@code lastConsumedOffset} undefined. */
-    @Test
-    void legacyConstructorHasNoLastConsumedOffset() {
-        TableBucket tb = new TableBucket(0L, 0);
-        Map<TableBucket, List<ScanRecord>> records = new HashMap<>();
-        records.put(tb, Collections.emptyList());
-
-        ScanRecords scanRecords = new ScanRecords(records);
-
-        assertThat(scanRecords.buckets()).containsExactly(tb);
-        assertThat(scanRecords.lastConsumedOffset(tb)).isNull();
-    }
-
     /**
-     * Verifies buckets with only advanced offsets are still exposed via {@link
-     * ScanRecords#buckets()} and carry their {@code lastConsumedOffset}.
+     * Verifies buckets(), isEmpty(), and consumedUpToOffset() semantics for progress-only polls.
      */
     @Test
-    void emptyBucketIsExposedViaBuckets() {
-        TableBucket bucketWithRecords = new TableBucket(0L, 0);
-        TableBucket emptyBucket = new TableBucket(0L, 1);
-
-        Map<TableBucket, List<ScanRecord>> records = new HashMap<>();
-        records.put(
-                bucketWithRecords,
-                Collections.singletonList(
-                        new ScanRecord(5L, 1000L, ChangeType.INSERT, row(1, "a"))));
-        // Empty-progress buckets also appear in records (as emptyList).
-        records.put(emptyBucket, Collections.emptyList());
-
-        Map<TableBucket, Long> lastConsumedOffsets = new HashMap<>();
-        lastConsumedOffsets.put(bucketWithRecords, 6L);
-        lastConsumedOffsets.put(emptyBucket, 10L);
-
-        ScanRecords scanRecords = new ScanRecords(records, lastConsumedOffsets);
-
-        assertThat(scanRecords.buckets()).containsExactlyInAnyOrder(bucketWithRecords, emptyBucket);
-        assertThat(scanRecords.records(emptyBucket)).isEmpty();
-        assertThat(scanRecords.lastConsumedOffset(bucketWithRecords)).isEqualTo(6L);
-        assertThat(scanRecords.lastConsumedOffset(emptyBucket)).isEqualTo(10L);
-        assertThat(scanRecords.lastConsumedOffset(new TableBucket(0L, 99))).isNull();
-    }
-
-    /**
-     * Verifies {@link ScanRecords#isEmpty()} reflects only materialized records, regardless of
-     * advanced offsets.
-     */
-    @Test
-    void isEmptyReflectsOnlyMaterializedRecords() {
+    void bucketsAndIsEmptySemantics() {
         TableBucket tb = new TableBucket(0L, 0);
 
         // No records and no progress: both isEmpty() and buckets() must be empty.
@@ -116,26 +72,33 @@ public class ScanRecordsTest {
         assertThat(trulyEmpty.isEmpty()).isTrue();
         assertThat(trulyEmpty.buckets()).isEmpty();
 
-        // Progress-only round: isEmpty() must stay true (no materialized records),
-        // while buckets() must still expose the advanced bucket for callers to detect.
-        Map<TableBucket, List<ScanRecord>> emptyRecords = new HashMap<>();
-        emptyRecords.put(tb, Collections.emptyList());
-        Map<TableBucket, Long> progressOnly = new HashMap<>();
-        progressOnly.put(tb, 42L);
-        ScanRecords progressOnlyRecords = new ScanRecords(emptyRecords, progressOnly);
-        assertThat(progressOnlyRecords.isEmpty()).isTrue();
-        assertThat(progressOnlyRecords.buckets()).containsExactly(tb);
-        assertThat(progressOnlyRecords.lastConsumedOffset(tb)).isEqualTo(42L);
+        // Progress-only round: isEmpty() stays true (no materialized records),
+        // but buckets() exposes the advanced buckets and consumedUpToOffset carries the offset.
+        TableBucket emptyBucket = new TableBucket(0L, 1);
+        Map<TableBucket, List<ScanRecord>> progressRecords = new HashMap<>();
+        progressRecords.put(tb, Collections.emptyList());
+        progressRecords.put(emptyBucket, Collections.emptyList());
+        Map<TableBucket, Long> progressOffsets = new HashMap<>();
+        progressOffsets.put(tb, 42L);
+        progressOffsets.put(emptyBucket, 10L);
+        ScanRecords progressOnly = new ScanRecords(progressRecords, progressOffsets);
+        assertThat(progressOnly.isEmpty()).isTrue();
+        assertThat(progressOnly.buckets()).containsExactlyInAnyOrder(tb, emptyBucket);
+        assertThat(progressOnly.records(emptyBucket)).isEmpty();
+        assertThat(progressOnly.consumedUpToOffset(tb)).isEqualTo(42L);
+        assertThat(progressOnly.consumedUpToOffset(emptyBucket)).isEqualTo(10L);
+        assertThat(progressOnly.consumedUpToOffset(new TableBucket(0L, 99))).isNull();
 
-        // Materialized records present: isEmpty() flips to false; legacy single-arg ctor still
-        // works.
-        Map<TableBucket, List<ScanRecord>> records = new HashMap<>();
-        records.put(
+        // Materialized records present: isEmpty() flips to false;
+        // the legacy single-arg constructor has no consumedUpToOffset.
+        Map<TableBucket, List<ScanRecord>> matRecords = new HashMap<>();
+        matRecords.put(
                 tb,
                 Collections.singletonList(
                         new ScanRecord(0L, 1000L, ChangeType.INSERT, row(1, "a"))));
-        ScanRecords withRecords = new ScanRecords(records);
+        ScanRecords withRecords = new ScanRecords(matRecords);
         assertThat(withRecords.isEmpty()).isFalse();
         assertThat(withRecords.buckets()).containsExactly(tb);
+        assertThat(withRecords.consumedUpToOffset(tb)).isNull();
     }
 }

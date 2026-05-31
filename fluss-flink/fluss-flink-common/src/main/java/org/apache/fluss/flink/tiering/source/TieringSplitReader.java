@@ -357,51 +357,49 @@ public class TieringSplitReader<WriteResult>
 
         // Iterate every polled bucket, including those that only advanced their offset.
         for (TableBucket bucket : scanRecords.buckets()) {
-            // no any stopping offset, just skip handle the records for the bucket
             Long stoppingOffset = currentTableStoppingOffsets.get(bucket);
             if (stoppingOffset == null) {
                 continue;
             }
 
-            List<ScanRecord> bucketScanRecords = scanRecords.records(bucket);
-            ScanRecord lastRecord = null;
+            List<ScanRecord> records = scanRecords.records(bucket);
             LakeWriter<WriteResult> lakeWriter = null;
+            ScanRecord lastRecord = null;
 
-            if (!bucketScanRecords.isEmpty()) {
-                for (ScanRecord record : bucketScanRecords) {
-                    // only tier records within the split range [start, stoppingOffset).
-                    if (record.logOffset() < stoppingOffset) {
-                        if (lakeWriter == null) {
-                            lakeWriter =
-                                    getOrCreateLakeWriter(
-                                            bucket,
-                                            currentTableSplitsByBucket
-                                                    .get(bucket)
-                                                    .getPartitionName());
-                        }
-                        lakeWriter.write(record);
-                        if (record.getSizeInBytes() > 0) {
-                            tieringMetrics.recordBytesRead(record.getSizeInBytes());
-                        }
-                    }
+            for (ScanRecord record : records) {
+                lastRecord = record;
+
+                // The scanner may return records beyond this split's exclusive stopping offset.
+                // Those records belong to the next split and must not be tiered here.
+                if (record.logOffset() >= stoppingOffset) {
+                    continue;
                 }
-                lastRecord = bucketScanRecords.get(bucketScanRecords.size() - 1);
+
+                if (lakeWriter == null) {
+                    lakeWriter =
+                            getOrCreateLakeWriter(
+                                    bucket,
+                                    currentTableSplitsByBucket.get(bucket).getPartitionName());
+                }
+                lakeWriter.write(record);
+                if (record.getSizeInBytes() > 0) {
+                    tieringMetrics.recordBytesRead(record.getSizeInBytes());
+                }
             }
 
-            // Prefer the scanner-reported lastConsumedOffset; fall back to the last record offset.
-            Long lastConsumedOffset = scanRecords.lastConsumedOffset(bucket);
-            boolean reachedEnd =
-                    lastConsumedOffset != null
-                            ? lastConsumedOffset >= stoppingOffset
-                            : lastRecord != null && lastRecord.logOffset() >= stoppingOffset - 1;
+            // consumedUpToOffset is an exclusive upper bound: all offsets before it have been
+            // consumed by the scanner in this poll round. It may advance even when records is
+            // empty, for example when FIRST_ROW filters duplicate upserts into empty WAL batches.
+            Long consumedUpToOffset = scanRecords.consumedUpToOffset(bucket);
+            checkState(
+                    consumedUpToOffset != null,
+                    "Missing consumed-up-to offset for polled bucket %s.",
+                    bucket);
 
-            if (!reachedEnd && lastRecord == null) {
-                continue;
-            }
-
-            // When reachedEnd, the tiered offset is stoppingOffset - 1 (exclusive bound).
-            // Timestamp prefers the current record, then the previously tracked value.
-            long tieredOffset = reachedEnd ? stoppingOffset - 1 : lastRecord.logOffset();
+            // The split owns offsets before stoppingOffset only. If the scanner consumed past
+            // the split boundary, cap the tiered progress at stoppingOffset so the next split
+            // still owns later data.
+            long tieredLogEndOffset = Math.min(consumedUpToOffset, stoppingOffset);
             long tieredTimestamp;
             if (lastRecord != null) {
                 tieredTimestamp = lastRecord.timestamp();
@@ -410,9 +408,11 @@ public class TieringSplitReader<WriteResult>
                 tieredTimestamp = latest != null ? latest.timestamp : UNKNOWN_BUCKET_TIMESTAMP;
             }
             currentTableTieredOffsetAndTimestamp.put(
-                    bucket, new LogOffsetAndTimestamp(tieredOffset, tieredTimestamp));
+                    bucket, new LogOffsetAndTimestamp(tieredLogEndOffset - 1, tieredTimestamp));
 
-            if (!reachedEnd) {
+            // The split owns offsets below stoppingOffset. If the scanner has not consumed up to
+            // that exclusive bound yet, keep the split active.
+            if (consumedUpToOffset < stoppingOffset) {
                 continue;
             }
 
