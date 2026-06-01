@@ -50,8 +50,12 @@ class FlussAppendPartitionReader(
   initialize()
 
   private def pollMoreRecords(): Unit = {
-    val scanRecords = logScanner.poll(POLL_TIMEOUT)
-    if ((scanRecords == null || scanRecords.isEmpty) && currentOffset < flussPartition.stopOffset) {
+    var scanRecords = logScanner.poll(POLL_TIMEOUT)
+    // Skip progress-only rounds (buckets were polled but no materialized records)
+    while (scanRecords != null && !scanRecords.buckets().isEmpty && scanRecords.isEmpty) {
+      scanRecords = logScanner.poll(POLL_TIMEOUT)
+    }
+    if ((scanRecords == null || scanRecords.buckets().isEmpty) && currentOffset < flussPartition.stopOffset) {
       throw new IllegalStateException(s"No more data from fluss server," +
         s" but current offset $currentOffset not reach the stop offset ${flussPartition.stopOffset}")
     }
