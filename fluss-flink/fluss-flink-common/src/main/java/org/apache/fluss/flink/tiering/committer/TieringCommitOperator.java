@@ -232,7 +232,12 @@ public class TieringCommitOperator<WriteResult, Committable>
 
             Map<TableBucket, Long> logEndOffsets = new HashMap<>();
             Map<TableBucket, Long> logMaxTieredTimestamps = new HashMap<>();
-            for (TableBucketWriteResult<WriteResult> writeResult : nonEmptyResults) {
+            // Lake commit only needs non-empty write results, but Fluss also needs offset metadata
+            // for buckets that finished through empty batches in the same commit.
+            for (TableBucketWriteResult<WriteResult> writeResult : committableWriteResults) {
+                if (writeResult.logEndOffset() < 0) {
+                    continue;
+                }
                 TableBucket tableBucket = writeResult.tableBucket();
                 logEndOffsets.put(tableBucket, writeResult.logEndOffset());
                 logMaxTieredTimestamps.put(tableBucket, writeResult.maxTimestamp());
