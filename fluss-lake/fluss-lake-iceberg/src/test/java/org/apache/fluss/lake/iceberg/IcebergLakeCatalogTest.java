@@ -21,7 +21,9 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.InvalidAlterTableException;
 import org.apache.fluss.exception.InvalidTableException;
+import org.apache.fluss.exception.TableAlreadyExistException;
 import org.apache.fluss.exception.TableNotExistException;
+import org.apache.fluss.lake.iceberg.utils.IcebergTableValidation;
 import org.apache.fluss.lake.lakestorage.TestingLakeCatalogContext;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableChange;
@@ -30,12 +32,19 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.coordinator.SchemaUpdate;
 import org.apache.fluss.types.DataTypes;
 
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.NullOrder;
 import org.apache.iceberg.PartitionField;
+import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.RowLevelOperationMode;
 import org.apache.iceberg.SortDirection;
 import org.apache.iceberg.SortField;
+import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.Namespace;
+import org.apache.iceberg.catalog.SupportsNamespaces;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.types.Types;
 import org.assertj.core.api.Assertions;
@@ -51,6 +60,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -1129,6 +1139,470 @@ class IcebergLakeCatalogTest {
                                         getLakeCatalogContext(mismatched, changes)))
                 .isInstanceOf(InvalidAlterTableException.class)
                 .hasMessageContaining("Iceberg schema is not compatible with Fluss schema");
+    }
+
+    // ==================== Tests for managing existing Iceberg tables ====================
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testCreateTableWithExistingCompatibleTable(boolean isPkTable) {
+        String database = "test_db";
+        String tableName =
+                isPkTable ? "existing_compatible_pk_table" : "existing_compatible_log_table";
+
+        Schema.Builder schemaBuilder =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING());
+        if (isPkTable) {
+            schemaBuilder.primaryKey("id");
+        }
+        Schema flussSchema = schemaBuilder.build();
+
+        TableDescriptor tableDescriptor =
+                isPkTable
+                        ? TableDescriptor.builder()
+                                .schema(flussSchema)
+                                .distributedBy(4, "id")
+                                .build()
+                        : TableDescriptor.builder().schema(flussSchema).distributedBy(3).build();
+
+        TablePath tablePath = TablePath.of(database, tableName);
+        TableIdentifier tableId = TableIdentifier.of(database, tableName);
+
+        // Create the Iceberg table via Fluss, then create again — should succeed
+        flussIcebergCatalog.createTable(
+                tablePath, tableDescriptor, new TestingLakeCatalogContext());
+        flussIcebergCatalog.createTable(
+                tablePath, tableDescriptor, new TestingLakeCatalogContext());
+
+        Table existingTable = flussIcebergCatalog.getIcebergCatalog().loadTable(tableId);
+        assertThat(existingTable).isNotNull();
+    }
+
+    @Test
+    void testCreateTableWithExistingIncompatibleSchema() {
+        String database = "test_db";
+        String tableName = "existing_incompatible_schema";
+
+        Schema flussSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(flussSchema).distributedBy(4, "id").build();
+
+        TablePath tablePath = TablePath.of(database, tableName);
+
+        // Create the Iceberg table via Fluss
+        flussIcebergCatalog.createTable(
+                tablePath, tableDescriptor, new TestingLakeCatalogContext());
+
+        // Try to create a table with a different schema at the same path
+        Schema differentSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("age", DataTypes.INT())
+                        .primaryKey("id")
+                        .build();
+
+        TableDescriptor differentDescriptor =
+                TableDescriptor.builder().schema(differentSchema).distributedBy(4, "id").build();
+
+        assertThatThrownBy(
+                        () ->
+                                flussIcebergCatalog.createTable(
+                                        tablePath,
+                                        differentDescriptor,
+                                        new TestingLakeCatalogContext()))
+                .isInstanceOf(TableAlreadyExistException.class)
+                .hasMessageContaining("schema is not compatible");
+    }
+
+    @Test
+    void testCreateTableWithExistingIncompatiblePartitionSpec() {
+        String database = "test_db";
+        String tableName = "existing_incompatible_partition";
+
+        Schema flussSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(flussSchema).distributedBy(4, "id").build();
+
+        TablePath tablePath = TablePath.of(database, tableName);
+
+        // Create the Iceberg table with bucket count 4
+        flussIcebergCatalog.createTable(
+                tablePath, tableDescriptor, new TestingLakeCatalogContext());
+
+        // Try to create with a different bucket count — only fails when isCreatingFlussTable=true
+        TableDescriptor differentDescriptor =
+                TableDescriptor.builder().schema(flussSchema).distributedBy(8, "id").build();
+
+        TestingLakeCatalogContext creatingContext =
+                new TestingLakeCatalogContext(differentDescriptor) {
+                    @Override
+                    public boolean isCreatingFlussTable() {
+                        return true;
+                    }
+                };
+        assertThatThrownBy(
+                        () ->
+                                flussIcebergCatalog.createTable(
+                                        tablePath, differentDescriptor, creatingContext))
+                .isInstanceOf(TableAlreadyExistException.class)
+                .hasMessageContaining("partition spec is not compatible");
+
+        // isCreatingFlussTable=false should succeed (skips partition check)
+        flussIcebergCatalog.createTable(
+                tablePath, differentDescriptor, new TestingLakeCatalogContext());
+    }
+
+    @Test
+    void testCreateTableWithExistingIncompatibleSortOrder() {
+        String database = "test_db";
+        String tableName = "existing_incompatible_sort_order";
+
+        Schema flussSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+
+        TablePath tablePath = TablePath.of(database, tableName);
+        TableIdentifier tableId = TableIdentifier.of(database, tableName);
+
+        // Create namespace first for direct Iceberg API table creation
+        ((SupportsNamespaces) flussIcebergCatalog.getIcebergCatalog())
+                .createNamespace(Namespace.of(database));
+
+        // Create an Iceberg table without system columns (user-created table)
+        // with DESC sort order (different from Fluss's ASC)
+        org.apache.iceberg.Schema icebergSchema =
+                new org.apache.iceberg.Schema(
+                        Arrays.asList(
+                                Types.NestedField.required(1, "id", Types.IntegerType.get()),
+                                Types.NestedField.optional(2, "name", Types.StringType.get())),
+                        Collections.singleton(1));
+
+        SortOrder descSortOrder = SortOrder.builderFor(icebergSchema).desc("id").build();
+        PartitionSpec partitionSpec =
+                PartitionSpec.builderFor(icebergSchema).bucket("id", 4).build();
+
+        flussIcebergCatalog
+                .getIcebergCatalog()
+                .buildTable(tableId, icebergSchema)
+                .withSortOrder(descSortOrder)
+                .withPartitionSpec(partitionSpec)
+                .withProperty("write.merge.mode", "merge-on-read")
+                .withProperty("write.delete.mode", "merge-on-read")
+                .withProperty("write.update.mode", "merge-on-read")
+                .create();
+
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(flussSchema).distributedBy(4, "id").build();
+
+        // isCreatingFlussTable=true should fail because sort order is not compatible
+        TestingLakeCatalogContext creatingContext =
+                new TestingLakeCatalogContext(tableDescriptor) {
+                    @Override
+                    public boolean isCreatingFlussTable() {
+                        return true;
+                    }
+                };
+        assertThatThrownBy(
+                        () ->
+                                flussIcebergCatalog.createTable(
+                                        tablePath, tableDescriptor, creatingContext))
+                .isInstanceOf(TableAlreadyExistException.class)
+                .hasMessageContaining("sort order is not compatible");
+
+        // isCreatingFlussTable=false should succeed (skips sort order check)
+        flussIcebergCatalog.createTable(
+                tablePath, tableDescriptor, new TestingLakeCatalogContext());
+    }
+
+    @Test
+    void testCreateTableWithExistingTableIdentifierFieldsMismatch() {
+        String database = "test_db";
+        String tableName = "existing_no_identifier_fields";
+
+        // Create an Iceberg table WITHOUT identifier fields (user-created, no system columns)
+        org.apache.iceberg.Schema icebergSchemaNoId =
+                new org.apache.iceberg.Schema(
+                        Arrays.asList(
+                                Types.NestedField.required(1, "id", Types.IntegerType.get()),
+                                Types.NestedField.optional(2, "name", Types.StringType.get())));
+        PartitionSpec partitionSpec =
+                PartitionSpec.builderFor(icebergSchemaNoId).bucket("id", 4).build();
+
+        TableIdentifier tableId = TableIdentifier.of(database, tableName);
+
+        // Create namespace first for direct Iceberg API table creation
+        ((SupportsNamespaces) flussIcebergCatalog.getIcebergCatalog())
+                .createNamespace(Namespace.of(database));
+
+        flussIcebergCatalog
+                .getIcebergCatalog()
+                .buildTable(tableId, icebergSchemaNoId)
+                .withPartitionSpec(partitionSpec)
+                .create();
+
+        // Try to create a PK table (WITH identifier fields) via Fluss
+        Schema flussSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(flussSchema).distributedBy(4, "id").build();
+
+        TablePath tablePath = TablePath.of(database, tableName);
+        assertThatThrownBy(
+                        () ->
+                                flussIcebergCatalog.createTable(
+                                        tablePath,
+                                        tableDescriptor,
+                                        new TestingLakeCatalogContext()))
+                .isInstanceOf(TableAlreadyExistException.class)
+                .hasMessageContaining("schema is not compatible");
+    }
+
+    @Test
+    void testCreateTableWithExistingNonEmptyTable() {
+        String database = "test_db";
+        String tableName = "existing_non_empty_table";
+
+        Schema flussSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(flussSchema).distributedBy(4, "id").build();
+
+        TablePath tablePath = TablePath.of(database, tableName);
+        TableIdentifier tableId = TableIdentifier.of(database, tableName);
+
+        // Create the Iceberg table and write data to make it non-empty
+        flussIcebergCatalog.createTable(
+                tablePath, tableDescriptor, new TestingLakeCatalogContext());
+        Table icebergTable = flussIcebergCatalog.getIcebergCatalog().loadTable(tableId);
+        DataFile dataFile =
+                DataFiles.builder(icebergTable.spec())
+                        .withPath("/tmp/test.parquet")
+                        .withFileSizeInBytes(100)
+                        .withRecordCount(1)
+                        .build();
+        icebergTable.newAppend().appendFile(dataFile).commit();
+
+        // isCreatingFlussTable=true should fail because the table is not empty
+        TestingLakeCatalogContext creatingContext =
+                new TestingLakeCatalogContext(tableDescriptor) {
+                    @Override
+                    public boolean isCreatingFlussTable() {
+                        return true;
+                    }
+                };
+        assertThatThrownBy(
+                        () ->
+                                flussIcebergCatalog.createTable(
+                                        tablePath, tableDescriptor, creatingContext))
+                .isInstanceOf(TableAlreadyExistException.class)
+                .hasMessageContaining("not empty");
+
+        // isCreatingFlussTable=false should succeed (skips empty check)
+        flussIcebergCatalog.createTable(
+                tablePath, tableDescriptor, new TestingLakeCatalogContext());
+    }
+
+    @Test
+    void testCreateTableWithExistingIncompatibleProperties() {
+        String database = "test_db";
+
+        org.apache.iceberg.Schema icebergSchema =
+                new org.apache.iceberg.Schema(
+                        Arrays.asList(
+                                Types.NestedField.required(1, "id", Types.IntegerType.get()),
+                                Types.NestedField.optional(2, "name", Types.StringType.get())),
+                        Collections.singleton(1));
+
+        Schema flussSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .primaryKey("id")
+                        .build();
+        TableDescriptor tableDescriptor =
+                TableDescriptor.builder().schema(flussSchema).distributedBy(4, "id").build();
+
+        ((SupportsNamespaces) flussIcebergCatalog.getIcebergCatalog())
+                .createNamespace(Namespace.of(database));
+
+        // Scenario 1: existing table has conflicting COW property values
+        String tableName1 = "existing_cow_properties";
+        TableIdentifier tableId1 = TableIdentifier.of(database, tableName1);
+        PartitionSpec partitionSpec1 =
+                PartitionSpec.builderFor(icebergSchema).bucket("id", 4).build();
+        SortOrder sortOrder1 = SortOrder.builderFor(icebergSchema).asc("id").build();
+        flussIcebergCatalog
+                .getIcebergCatalog()
+                .buildTable(tableId1, icebergSchema)
+                .withPartitionSpec(partitionSpec1)
+                .withSortOrder(sortOrder1)
+                .withProperty("write.merge.mode", "copy-on-write")
+                .withProperty("write.delete.mode", "copy-on-write")
+                .withProperty("write.update.mode", "copy-on-write")
+                .create();
+
+        TablePath tablePath1 = TablePath.of(database, tableName1);
+        assertThatThrownBy(
+                        () ->
+                                flussIcebergCatalog.createTable(
+                                        tablePath1,
+                                        tableDescriptor,
+                                        new TestingLakeCatalogContext()))
+                .isInstanceOf(TableAlreadyExistException.class)
+                .hasMessageContaining("properties are not compatible");
+
+        // Scenario 2: existing table is missing MOR properties (user-created table)
+        // Should succeed because arePropertiesCompatible only checks conflicting shared keys
+        String tableName2 = "existing_missing_properties";
+        TableIdentifier tableId2 = TableIdentifier.of(database, tableName2);
+        PartitionSpec partitionSpec2 =
+                PartitionSpec.builderFor(icebergSchema).bucket("id", 4).build();
+        SortOrder sortOrder2 = SortOrder.builderFor(icebergSchema).asc("id").build();
+        flussIcebergCatalog
+                .getIcebergCatalog()
+                .buildTable(tableId2, icebergSchema)
+                .withPartitionSpec(partitionSpec2)
+                .withSortOrder(sortOrder2)
+                .create();
+
+        TablePath tablePath2 = TablePath.of(database, tableName2);
+        flussIcebergCatalog.createTable(
+                tablePath2, tableDescriptor, new TestingLakeCatalogContext());
+    }
+
+    @Test
+    void testIsPartitionSpecCompatible() {
+        org.apache.iceberg.Schema schema =
+                new org.apache.iceberg.Schema(
+                        Types.NestedField.required(1, "id", Types.IntegerType.get()),
+                        Types.NestedField.optional(2, "name", Types.StringType.get()),
+                        Types.NestedField.required(3, BUCKET_COLUMN_NAME, Types.IntegerType.get()),
+                        Types.NestedField.required(4, OFFSET_COLUMN_NAME, Types.LongType.get()),
+                        Types.NestedField.required(
+                                5, TIMESTAMP_COLUMN_NAME, Types.TimestampType.withZone()));
+
+        // Same partition spec
+        PartitionSpec spec1 = PartitionSpec.builderFor(schema).bucket("id", 4).build();
+        PartitionSpec spec2 = PartitionSpec.builderFor(schema).bucket("id", 4).build();
+        assertThat(IcebergTableValidation.isPartitionSpecCompatible(spec1, spec2)).isTrue();
+
+        // Different bucket count (different transform)
+        PartitionSpec spec3 = PartitionSpec.builderFor(schema).bucket("id", 8).build();
+        assertThat(IcebergTableValidation.isPartitionSpecCompatible(spec1, spec3)).isFalse();
+
+        // Different field count
+        PartitionSpec spec4 =
+                PartitionSpec.builderFor(schema).bucket("id", 4).bucket("name", 4).build();
+        assertThat(IcebergTableValidation.isPartitionSpecCompatible(spec1, spec4)).isFalse();
+
+        // Same partition field name but different source column
+        org.apache.iceberg.Schema schema2 =
+                new org.apache.iceberg.Schema(
+                        Types.NestedField.required(1, "order_id", Types.IntegerType.get()),
+                        Types.NestedField.optional(2, "name", Types.StringType.get()),
+                        Types.NestedField.required(3, BUCKET_COLUMN_NAME, Types.IntegerType.get()),
+                        Types.NestedField.required(4, OFFSET_COLUMN_NAME, Types.LongType.get()),
+                        Types.NestedField.required(
+                                5, TIMESTAMP_COLUMN_NAME, Types.TimestampType.withZone()));
+        // spec1: bucket(id, 4) → partition field name "id_bucket"
+        // spec5: bucket(order_id, 4) → partition field name "order_id_bucket" (different name)
+        PartitionSpec spec5 = PartitionSpec.builderFor(schema2).bucket("order_id", 4).build();
+        assertThat(IcebergTableValidation.isPartitionSpecCompatible(spec1, spec5)).isFalse();
+    }
+
+    @Test
+    void testIsSortOrderCompatible() {
+        org.apache.iceberg.Schema schema =
+                new org.apache.iceberg.Schema(
+                        Types.NestedField.required(1, "id", Types.IntegerType.get()),
+                        Types.NestedField.optional(2, "name", Types.StringType.get()),
+                        Types.NestedField.required(3, BUCKET_COLUMN_NAME, Types.IntegerType.get()),
+                        Types.NestedField.required(4, OFFSET_COLUMN_NAME, Types.LongType.get()),
+                        Types.NestedField.required(
+                                5, TIMESTAMP_COLUMN_NAME, Types.TimestampType.withZone()));
+
+        // Same sort order
+        SortOrder order1 = SortOrder.builderFor(schema).asc(OFFSET_COLUMN_NAME).build();
+        SortOrder order2 = SortOrder.builderFor(schema).asc(OFFSET_COLUMN_NAME).build();
+        assertThat(IcebergTableValidation.isSortOrderCompatible(order1, order2, schema)).isTrue();
+
+        // Different direction
+        SortOrder order3 = SortOrder.builderFor(schema).desc(OFFSET_COLUMN_NAME).build();
+        assertThat(IcebergTableValidation.isSortOrderCompatible(order1, order3, schema)).isFalse();
+
+        // Different field count
+        SortOrder order4 =
+                SortOrder.builderFor(schema)
+                        .asc(OFFSET_COLUMN_NAME)
+                        .asc(TIMESTAMP_COLUMN_NAME)
+                        .build();
+        assertThat(IcebergTableValidation.isSortOrderCompatible(order1, order4, schema)).isFalse();
+
+        // Different null order
+        SortOrder order5 =
+                SortOrder.builderFor(schema).asc(OFFSET_COLUMN_NAME, NullOrder.NULLS_LAST).build();
+        assertThat(IcebergTableValidation.isSortOrderCompatible(order1, order5, schema)).isFalse();
+
+        // Different transform (bucket sort vs identity sort)
+        SortOrder order6 = SortOrder.builderFor(schema).asc("id").build();
+        assertThat(IcebergTableValidation.isSortOrderCompatible(order1, order6, schema)).isFalse();
+    }
+
+    @Test
+    void testArePropertiesCompatible() {
+        // Same properties
+        Map<String, String> props1 =
+                Map.of("write.merge.mode", "merge-on-read", "custom.key", "v1");
+        Map<String, String> props2 =
+                Map.of("write.merge.mode", "merge-on-read", "custom.key", "v1");
+        assertThat(IcebergTableValidation.arePropertiesCompatible(props1, props2)).isTrue();
+
+        // Conflicting value for shared key
+        Map<String, String> props3 = Map.of("write.merge.mode", "copy-on-write");
+        assertThat(IcebergTableValidation.arePropertiesCompatible(props1, props3)).isFalse();
+
+        // Missing key in existing — allowed (only shared keys are compared)
+        Map<String, String> props4 = Map.of("write.merge.mode", "merge-on-read");
+        assertThat(IcebergTableValidation.arePropertiesCompatible(props4, props1)).isTrue();
+
+        // Extra keys in existing — ignored
+        Map<String, String> props5 =
+                new java.util.HashMap<>(Map.of("write.merge.mode", "merge-on-read"));
+        props5.put("custom.key", "v1");
+        props5.put("extra.key", "extra_value");
+        assertThat(IcebergTableValidation.arePropertiesCompatible(props5, props1)).isTrue();
+
+        // Empty maps
+        assertThat(IcebergTableValidation.arePropertiesCompatible(Map.of(), Map.of())).isTrue();
+
+        // Expected non-empty but existing empty — allowed (no shared keys to conflict)
+        assertThat(IcebergTableValidation.arePropertiesCompatible(Map.of(), props1)).isTrue();
     }
 
     private void createLogTable(String database, String tableName) {

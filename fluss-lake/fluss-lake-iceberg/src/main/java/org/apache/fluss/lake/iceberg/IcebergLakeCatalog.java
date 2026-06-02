@@ -24,6 +24,7 @@ import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.TableAlreadyExistException;
 import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.lake.iceberg.utils.IcebergCatalogUtils;
+import org.apache.fluss.lake.iceberg.utils.IcebergTableValidation;
 import org.apache.fluss.lake.lakestorage.LakeCatalog;
 import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
@@ -112,7 +113,8 @@ public class IcebergLakeCatalog implements LakeCatalog {
         PartitionSpec partitionSpec =
                 createPartitionSpec(tableDescriptor, icebergSchema, isPkTable);
         SortOrder sortOrder = createSortOrder(icebergSchema);
-        tableBuilder.withProperties(buildTableProperties(tableDescriptor, isPkTable));
+        Map<String, String> tableProperties = buildTableProperties(tableDescriptor, isPkTable);
+        tableBuilder.withProperties(tableProperties);
         tableBuilder.withPartitionSpec(partitionSpec);
         tableBuilder.withSortOrder(sortOrder);
         try {
@@ -129,7 +131,61 @@ public class IcebergLakeCatalog implements LakeCatalog {
                                         + "Namespace %s still doesn't exist although create namespace "
                                         + "successfully, please try again.",
                                 tablePath, tablePath.getDatabaseName()));
+            } catch (TableAlreadyExistException e2) {
+                validateExistingTable(
+                        icebergId,
+                        icebergSchema,
+                        partitionSpec,
+                        sortOrder,
+                        tableProperties,
+                        context,
+                        tablePath);
             }
+        } catch (TableAlreadyExistException e) {
+            validateExistingTable(
+                    icebergId,
+                    icebergSchema,
+                    partitionSpec,
+                    sortOrder,
+                    tableProperties,
+                    context,
+                    tablePath);
+        }
+    }
+
+    /**
+     * Loads the existing Iceberg table and validates its compatibility using {@link
+     * IcebergTableValidation}. Handles the race condition where the table reports as existing but
+     * is concurrently deleted.
+     */
+    private void validateExistingTable(
+            TableIdentifier icebergId,
+            Schema icebergSchema,
+            PartitionSpec partitionSpec,
+            SortOrder sortOrder,
+            Map<String, String> expectedProperties,
+            Context context,
+            TablePath tablePath)
+            throws TableAlreadyExistException {
+        try {
+            Table existingTable = icebergCatalog.loadTable(icebergId);
+            IcebergTableValidation.validateExistingTable(
+                    existingTable,
+                    icebergSchema,
+                    partitionSpec,
+                    sortOrder,
+                    expectedProperties,
+                    context,
+                    tablePath);
+        } catch (NoSuchTableException nste) {
+            // shouldn't happen: table reported as existing but could not be loaded
+            throw new InvalidAlterTableException(
+                    String.format(
+                            "Failed to create table %s in Iceberg. The table already existed "
+                                    + "during the initial creation attempt, but subsequently "
+                                    + "could not be found when trying to load it. "
+                                    + "Please check whether the Iceberg table was manually deleted, and try again.",
+                            tablePath));
         }
     }
 
@@ -266,34 +322,15 @@ public class IcebergLakeCatalog implements LakeCatalog {
         }
         // isPkTable=false: identifier fields don't affect the comparison
         Schema expectedSchema = convertToIcebergSchema(flussTableDescriptor, false);
-
-        Schema normalizedIceberg = TypeUtil.assignIncreasingFreshIds(icebergSchema);
-        Schema normalizedExpected = TypeUtil.assignIncreasingFreshIds(expectedSchema);
-
-        List<Types.NestedField> currentFields = normalizedIceberg.columns();
-        List<Types.NestedField> expectedFields = normalizedExpected.columns();
-
-        if (currentFields.size() != expectedFields.size()) {
-            return false;
-        }
-
-        for (int i = 0; i < currentFields.size(); i++) {
-            Types.NestedField current = currentFields.get(i);
-            Types.NestedField expected = expectedFields.get(i);
-            if (!current.name().equals(expected.name())
-                    || !current.type().equals(expected.type())
-                    || current.isOptional() != expected.isOptional()) {
-                return false;
-            }
-        }
-        return true;
+        return IcebergTableValidation.isIcebergSchemaCompatible(icebergSchema, expectedSchema);
     }
 
     private TableIdentifier toIcebergTableIdentifier(TablePath tablePath) {
         return TableIdentifier.of(tablePath.getDatabaseName(), tablePath.getTableName());
     }
 
-    private void createTable(TablePath tablePath, Catalog.TableBuilder tableBuilder) {
+    private void createTable(TablePath tablePath, Catalog.TableBuilder tableBuilder)
+            throws TableAlreadyExistException {
         try {
             tableBuilder.create();
         } catch (AlreadyExistsException e) {
