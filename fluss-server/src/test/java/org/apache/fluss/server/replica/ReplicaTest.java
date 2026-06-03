@@ -147,7 +147,8 @@ final class ReplicaTest extends ReplicaTestBase {
                 schemaGetter,
                 DEFAULT_COMPRESSION,
                 null,
-                projectionCache);
+                projectionCache,
+                DEFAULT_SCHEMA_ID);
         LogReadInfo logReadInfo = logReplica.fetchRecords(fetchParams);
         assertLogRecordsEquals(
                 DATA1_ROW_TYPE, logReadInfo.getFetchedData().getRecords(), DATA1, schemaGetter);
@@ -173,7 +174,8 @@ final class ReplicaTest extends ReplicaTestBase {
                 schemaGetter,
                 DEFAULT_COMPRESSION,
                 null,
-                projectionCache);
+                projectionCache,
+                DEFAULT_SCHEMA_ID);
         logReadInfo = logReplica.fetchRecords(fetchParams);
         assertLogRecordsEquals(
                 2, DATA2_ROW_TYPE, logReadInfo.getFetchedData().getRecords(), DATA2, schemaGetter);
@@ -838,7 +840,8 @@ final class ReplicaTest extends ReplicaTestBase {
                 replica.getSchemaGetter(),
                 DEFAULT_COMPRESSION,
                 null,
-                new ProjectionPushdownCache());
+                new ProjectionPushdownCache(),
+                DEFAULT_SCHEMA_ID);
         LogReadInfo logReadInfo = replica.fetchRecords(fetchParams);
         return logReadInfo.getFetchedData().getRecords();
     }

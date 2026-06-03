@@ -166,18 +166,24 @@ class FileLogProjectionTest {
 
     @Test
     void testProjectionOldDataWithNewSchema() throws Exception {
-        // Currently, we only support add column at last.
+        // Schema evolution: data was written with schema 1 (2 columns: a INT, b STRING),
+        // but the client uses schema 2 (3 columns: a INT, b STRING, c STRING).
+        // When projecting columns that include the newly added column (c),
+        // the server should return NULL values for the missing column.
         short schemaId = 1;
+        int targetSchemaId = 2;
         try (FileLogRecords records =
                 createFileLogRecords(
                         schemaId, LOG_MAGIC_VALUE_V1, TestData.DATA1_ROW_TYPE, TestData.DATA1)) {
 
             ProjectionPushdownCache cache = new ProjectionPushdownCache();
             FileLogProjection projection = new FileLogProjection(cache);
+            // Project column b (index 1), which exists in both schemas
             assertThat(
                             doProjection(
                                     2L,
-                                    2,
+                                    schemaId,
+                                    targetSchemaId,
                                     projection,
                                     records,
                                     new int[] {1},
@@ -194,18 +200,24 @@ class FileLogProjectionTest {
                             new Object[] {"i"},
                             new Object[] {"j"});
 
-            assertThatThrownBy(
-                            () ->
-                                    doProjection(
-                                            1L,
-                                            2,
-                                            projection,
-                                            records,
-                                            new int[] {0, 2},
-                                            records.sizeInBytes()))
-                    .isInstanceOf(InvalidColumnProjectionException.class)
-                    .hasMessage(
-                            "Projected fields [0, 2] is out of bound for schema with 2 fields.");
+            // Project columns a (index 0) and c (index 2), where c is newly added.
+            // Column c should be NULL for all rows since it doesn't exist in the old schema.
+            List<Object[]> results =
+                    doProjection(
+                            1L,
+                            schemaId,
+                            targetSchemaId,
+                            projection,
+                            records,
+                            new int[] {0, 2},
+                            records.sizeInBytes());
+            assertThat(results.size()).isEqualTo(TestData.DATA1.size());
+            for (int i = 0; i < results.size(); i++) {
+                // Column a should have the original data
+                assertThat(results.get(i)[0]).isEqualTo(TestData.DATA1.get(i)[0]);
+                // Column c should be NULL (newly added column not present in old data)
+                assertThat(results.get(i)[1]).isNull();
+            }
         }
     }
 
@@ -462,7 +474,13 @@ class FileLogProjectionTest {
             int fetchMaxBytes)
             throws Exception {
         return doProjection(
-                1L, DEFAULT_SCHEMA_ID, projection, fileLogRecords, projectedFields, fetchMaxBytes);
+                1L,
+                DEFAULT_SCHEMA_ID,
+                DEFAULT_SCHEMA_ID,
+                projection,
+                fileLogRecords,
+                projectedFields,
+                fetchMaxBytes);
     }
 
     private List<Object[]> doProjection(
@@ -473,18 +491,39 @@ class FileLogProjectionTest {
             int[] projectedFields,
             int fetchMaxBytes)
             throws Exception {
+        return doProjection(
+                tableId,
+                schemaId,
+                schemaId,
+                projection,
+                fileLogRecords,
+                projectedFields,
+                fetchMaxBytes);
+    }
+
+    private List<Object[]> doProjection(
+            long tableId,
+            int schemaId,
+            int targetSchemaId,
+            FileLogProjection projection,
+            FileLogRecords fileLogRecords,
+            int[] projectedFields,
+            int fetchMaxBytes)
+            throws Exception {
         projection.setCurrentProjection(
-                tableId, testingSchemaGetter, DEFAULT_COMPRESSION, projectedFields);
+                tableId, testingSchemaGetter, DEFAULT_COMPRESSION, projectedFields, targetSchemaId);
         LogRecords project =
                 projection.project(
                         fileLogRecords.channel(), 0, fileLogRecords.sizeInBytes(), fetchMaxBytes);
         assertThat(project.sizeInBytes()).isLessThanOrEqualTo(fetchMaxBytes);
-        RowType rowType = testingSchemaGetter.getSchema(schemaId).getRowType();
+        // Use the target (latest) schema for projected row type, since projectedFields
+        // are based on the target schema's column positions
+        RowType rowType = testingSchemaGetter.getSchema(targetSchemaId).getRowType();
         RowType projectedType = rowType.project(projectedFields);
         List<Object[]> results = new ArrayList<>();
         long expectedOffset = 0L;
         try (LogRecordReadContext context =
-                createArrowReadContext(projectedType, schemaId, testingSchemaGetter, true)) {
+                createArrowReadContext(projectedType, targetSchemaId, testingSchemaGetter, true)) {
             for (LogRecordBatch batch : project.batches()) {
                 try (CloseableIterator<LogRecord> records = batch.records(context)) {
                     while (records.hasNext()) {
@@ -548,7 +587,8 @@ class FileLogProjectionTest {
                 1L,
                 testingSchemaGetter,
                 DEFAULT_COMPRESSION,
-                new int[] {0, 2}); // Project columns a and c
+                new int[] {0, 2},
+                schemaIdForData2); // Project columns a and c
 
         // Get the first batch
         FileLogInputStream.FileChannelLogRecordBatch batch =
@@ -613,7 +653,7 @@ class FileLogProjectionTest {
 
         FileLogProjection projection = new FileLogProjection(new ProjectionPushdownCache());
         projection.setCurrentProjection(
-                1L, testingSchemaGetter, DEFAULT_COMPRESSION, new int[] {0});
+                1L, testingSchemaGetter, DEFAULT_COMPRESSION, new int[] {0}, DEFAULT_SCHEMA_ID);
 
         // Get the batch (should be empty)
         FileLogInputStream.FileChannelLogRecordBatch batch =
@@ -645,7 +685,8 @@ class FileLogProjectionTest {
                 1L,
                 testingSchemaGetter,
                 DEFAULT_COMPRESSION,
-                new int[] {1}); // Project only column b
+                new int[] {1},
+                schemaIdForData2); // Project only column b
 
         FileLogInputStream.FileChannelLogRecordBatch batch =
                 fileLogRecords.batchIterator(0, -1).next();
@@ -697,7 +738,8 @@ class FileLogProjectionTest {
                 1L,
                 testingSchemaGetter,
                 DEFAULT_COMPRESSION,
-                new int[] {0, 1, 2}); // Project all columns
+                new int[] {0, 1, 2},
+                schemaIdForData2); // Project all columns
 
         FileLogInputStream.FileChannelLogRecordBatch batch =
                 fileLogRecords.batchIterator(0, -1).next();
@@ -768,7 +810,8 @@ class FileLogProjectionTest {
                 1L,
                 testingSchemaGetter,
                 DEFAULT_COMPRESSION,
-                new int[] {0}); // Project only column a
+                new int[] {0},
+                DEFAULT_SCHEMA_ID); // Project only column a
 
         // Test projection on first batch
         FileLogInputStream.FileChannelLogRecordBatch firstBatch =
@@ -834,7 +877,8 @@ class FileLogProjectionTest {
                 1L,
                 testingSchemaGetter,
                 DEFAULT_COMPRESSION,
-                new int[] {0, 1}); // Project columns a and b
+                new int[] {0, 1},
+                DEFAULT_SCHEMA_ID); // Project columns a and b
 
         FileLogInputStream.FileChannelLogRecordBatch batch =
                 fileLogRecords.batchIterator(0, -1).next();
@@ -885,7 +929,8 @@ class FileLogProjectionTest {
                 1L,
                 testingSchemaGetter,
                 DEFAULT_COMPRESSION,
-                new int[] {0, 1}); // Project columns a and b
+                new int[] {0, 1},
+                DEFAULT_SCHEMA_ID); // Project columns a and b
 
         FileLogInputStream.FileChannelLogRecordBatch batch =
                 fileLogRecords.batchIterator(0, -1).next();
@@ -944,7 +989,8 @@ class FileLogProjectionTest {
                 1L,
                 testingSchemaGetter,
                 DEFAULT_COMPRESSION,
-                new int[] {0, 2}); // Project columns a and c
+                new int[] {0, 2},
+                schemaIdForData2); // Project columns a and c
 
         // Use project() method instead of projectRecordBatch()
         BytesViewLogRecords projectedRecords =

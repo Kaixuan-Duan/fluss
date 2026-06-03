@@ -1455,7 +1455,8 @@ public class ReplicaManager implements ServerReconfigurable {
                         replica.getSchemaGetter(),
                         replica.getArrowCompressionInfo(),
                         fetchReqInfo.getProjectFields(),
-                        projectionsCache);
+                        projectionsCache,
+                        replica.getTableInfo().getSchemaId());
                 LogReadInfo readInfo = replica.fetchRecords(fetchParams);
 
                 // Once we read from a non-empty bucket, we stop ignoring request and bucket

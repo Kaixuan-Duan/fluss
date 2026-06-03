@@ -19,6 +19,7 @@ package org.apache.fluss.record;
 
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.compression.ArrowCompressionInfo;
+import org.apache.fluss.compression.FlussLZ4BlockOutputStream;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.record.FileLogInputStream.FileChannelLogRecordBatch;
@@ -41,11 +42,19 @@ import org.apache.fluss.shaded.arrow.org.apache.arrow.vector.types.pojo.Field;
 import org.apache.fluss.shaded.arrow.org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.ArrowUtils;
+import org.apache.fluss.utils.IOUtils;
 import org.apache.fluss.utils.types.Tuple2;
 
+import com.github.luben.zstd.Zstd;
+
+import javax.annotation.Nullable;
+
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.Channels;
@@ -53,6 +62,7 @@ import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
+import java.util.Collections;
 import java.util.List;
 
 import static org.apache.fluss.record.DefaultLogRecordBatch.APPEND_ONLY_FLAG_MASK;
@@ -105,6 +115,7 @@ public class FileLogProjection {
     private long tableId;
     private ArrowCompressionInfo compressionInfo;
     private int[] selectedFieldPositions;
+    private int targetSchemaId;
 
     public FileLogProjection(ProjectionPushdownCache projectionsCache) {
         this.projectionsCache = projectionsCache;
@@ -120,11 +131,13 @@ public class FileLogProjection {
             long tableId,
             SchemaGetter schemaGetter,
             ArrowCompressionInfo compressionInfo,
-            int[] selectedFieldPositions) {
+            int[] selectedFieldPositions,
+            int targetSchemaId) {
         this.tableId = tableId;
         this.schemaGetter = schemaGetter;
         this.compressionInfo = compressionInfo;
         this.selectedFieldPositions = selectedFieldPositions;
+        this.targetSchemaId = targetSchemaId;
     }
 
     /**
@@ -290,12 +303,7 @@ public class FileLogProjection {
 
         arrowMetadataBuffer.rewind();
         Message metadata = Message.getRootAsMessage(arrowMetadataBuffer);
-        ProjectedArrowBatch projectedArrowBatch =
-                projectArrowBatch(
-                        metadata,
-                        currentProjection.nodesProjection,
-                        currentProjection.buffersProjection,
-                        currentProjection.bufferCount);
+        ProjectedArrowBatch projectedArrowBatch = projectArrowBatch(metadata, currentProjection);
         long arrowBodyLength = projectedArrowBatch.bodyLength();
 
         int newBatchSizeInBytes =
@@ -337,35 +345,279 @@ public class FileLogProjection {
         projectedArrowBatch.buffers.forEach(
                 b -> builder.addBytes(channel, bufferOffset + b.getOffset(), (int) b.getSize()));
 
+        // Write NULL column buffers for missing fields (schema evolution)
+        if (projectedArrowBatch.nullColumnsBodyLength > 0
+                && projectedArrowBatch.nullColumnCompressedData != null) {
+            builder.addBytes(projectedArrowBatch.nullColumnCompressedData);
+        }
+
         return newBatchSizeInBytes;
     }
 
-    private ProjectedArrowBatch projectArrowBatch(
-            Message metadata, BitSet nodesProjection, BitSet buffersProjection, int bufferCount) {
+    private ProjectedArrowBatch projectArrowBatch(Message metadata, ProjectionInfo projectionInfo) {
         List<ArrowFieldNode> newNodes = new ArrayList<>();
         List<ArrowBuffer> newBufferLayouts = new ArrayList<>();
         List<ArrowBuffer> selectedBuffers = new ArrayList<>();
         RecordBatch recordBatch = (RecordBatch) metadata.header(new RecordBatch());
         long numRecords = recordBatch.length();
-        for (int i = nodesProjection.nextSetBit(0); i >= 0; i = nodesProjection.nextSetBit(i + 1)) {
+
+        // Project existing field nodes
+        for (int i = projectionInfo.nodesProjection.nextSetBit(0);
+                i >= 0;
+                i = projectionInfo.nodesProjection.nextSetBit(i + 1)) {
             FieldNode node = recordBatch.nodes(i);
             newNodes.add(new ArrowFieldNode(node.length(), node.nullCount()));
         }
+
+        // Project existing field buffers
         long bodyLength = metadata.bodyLength();
         long newOffset = 0L;
-        for (int i = buffersProjection.nextSetBit(0);
+        for (int i = projectionInfo.buffersProjection.nextSetBit(0);
                 i >= 0;
-                i = buffersProjection.nextSetBit(i + 1)) {
+                i = projectionInfo.buffersProjection.nextSetBit(i + 1)) {
             Buffer buf = recordBatch.buffers(i);
             long nextOffset =
-                    i < bufferCount - 1 ? recordBatch.buffers(i + 1).offset() : bodyLength;
+                    i < projectionInfo.bufferCount - 1
+                            ? recordBatch.buffers(i + 1).offset()
+                            : bodyLength;
             long paddedLength = nextOffset - buf.offset();
             selectedBuffers.add(new ArrowBuffer(buf.offset(), paddedLength));
             newBufferLayouts.add(new ArrowBuffer(newOffset, buf.length()));
             newOffset += paddedLength;
         }
 
-        return new ProjectedArrowBatch(numRecords, newNodes, newBufferLayouts, selectedBuffers);
+        // Append NULL columns for missing fields (schema evolution: newly added columns)
+        NullColumnsMetadata nullColumns = null;
+        if (projectionInfo.nullColumnsArrowSchema != null) {
+            nullColumns =
+                    appendNullColumns(
+                            projectionInfo.nullColumnsArrowSchema,
+                            numRecords,
+                            newNodes,
+                            newBufferLayouts,
+                            newOffset);
+        }
+
+        return new ProjectedArrowBatch(
+                numRecords,
+                newNodes,
+                newBufferLayouts,
+                selectedBuffers,
+                nullColumns != null ? nullColumns.bodyLength : 0L,
+                nullColumns != null ? nullColumns.bufferData : null);
+    }
+
+    /**
+     * Append NULL column field nodes, buffer layouts, and buffer data for columns that are missing
+     * from the old schema (newly added columns via schema evolution).
+     *
+     * <p>Each NULL column gets a field node with nullCount = numRecords, a validity buffer
+     * (all-zero bits indicating all NULL), and zero-length data/offset buffers. If compression is
+     * enabled, the validity buffer data is compressed to match the batch's compression format.
+     *
+     * @param nullColumnsSchema the Arrow schema of the missing columns
+     * @param numRecords the number of records in the batch
+     * @param nodes the list to append field nodes to
+     * @param bufferLayouts the list to append buffer layouts to
+     * @param startOffset the starting offset for buffer layout positions
+     * @return metadata about the NULL column buffers (body length and data)
+     */
+    private NullColumnsMetadata appendNullColumns(
+            Schema nullColumnsSchema,
+            long numRecords,
+            List<ArrowFieldNode> nodes,
+            List<ArrowBuffer> bufferLayouts,
+            long startOffset) {
+
+        // Flatten the NULL columns schema to get all field nodes (including nested types)
+        List<Field> nullFields = new ArrayList<>();
+        flattenNullFields(nullColumnsSchema.getFields(), nullFields);
+
+        boolean needsCompression = compressionInfo != ArrowCompressionInfo.NO_COMPRESSION;
+        ByteArrayOutputStream nullBufOut = new ByteArrayOutputStream();
+        long nullColumnsBodyLength = 0L;
+        long newOffset = startOffset;
+
+        for (Field nullField : nullFields) {
+            // Add field node: all records are NULL (nullCount = numRecords)
+            nodes.add(new ArrowFieldNode(numRecords, numRecords));
+
+            // Add buffer layouts for this NULL field
+            int bufferCountForType = TypeLayout.getTypeBufferCount(nullField.getType());
+            for (int bufIdx = 0; bufIdx < bufferCountForType; bufIdx++) {
+                if (bufIdx == 0) {
+                    newOffset =
+                            appendNullValidityBuffer(
+                                    numRecords,
+                                    needsCompression,
+                                    bufferLayouts,
+                                    nullBufOut,
+                                    newOffset);
+                    nullColumnsBodyLength = newOffset - startOffset;
+                } else {
+                    // Data/offset buffers: 0 bytes for all-NULL columns
+                    bufferLayouts.add(new ArrowBuffer(newOffset, 0));
+                }
+            }
+        }
+
+        return new NullColumnsMetadata(nullColumnsBodyLength, nullBufOut.toByteArray());
+    }
+
+    /**
+     * Append a NULL validity buffer (all-zero bits) for a single NULL column.
+     *
+     * <p>If compression is enabled, the validity buffer data is compressed to match the batch's
+     * compression format. Otherwise, raw zero bytes are written.
+     *
+     * @param numRecords the number of records in the batch
+     * @param needsCompression whether compression is enabled for this batch
+     * @param bufferLayouts the list to append the buffer layout to
+     * @param nullBufOut the output stream to write the buffer data to
+     * @param currentOffset the current offset in the body
+     * @return the updated offset after appending the validity buffer
+     */
+    private long appendNullValidityBuffer(
+            long numRecords,
+            boolean needsCompression,
+            List<ArrowBuffer> bufferLayouts,
+            ByteArrayOutputStream nullBufOut,
+            long currentOffset) {
+
+        // Validity buffer: contains all-zero bits (indicating all NULL)
+        long validitySize = (numRecords + 7) / 8;
+        long paddedValiditySize = (validitySize + 7) / 8 * 8;
+
+        if (needsCompression) {
+            // Compress the validity buffer data
+            byte[] uncompressedData = new byte[(int) paddedValiditySize];
+            // All bytes are zero by default (all validity bits = 0)
+            byte[] compressedData = compressBuffer(uncompressedData, compressionInfo);
+            long paddedCompressedSize = (compressedData.length + 7) / 8 * 8;
+
+            // Buffer layout records the compressed size (actual body size)
+            bufferLayouts.add(new ArrowBuffer(currentOffset, compressedData.length));
+            try {
+                nullBufOut.write(compressedData);
+                // Pad to 8-byte alignment
+                int padding = (int) (paddedCompressedSize - compressedData.length);
+                nullBufOut.write(new byte[padding]);
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to write NULL column buffer data", e);
+            }
+            return currentOffset + paddedCompressedSize;
+        } else {
+            // No compression: buffer layout records the uncompressed size
+            bufferLayouts.add(new ArrowBuffer(currentOffset, validitySize));
+            try {
+                nullBufOut.write(new byte[(int) paddedValiditySize]);
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to write NULL column buffer data", e);
+            }
+            return currentOffset + paddedValiditySize;
+        }
+    }
+
+    /** Metadata about NULL column buffers appended during projection. */
+    private static final class NullColumnsMetadata {
+        final long bodyLength;
+        final byte[] bufferData;
+
+        NullColumnsMetadata(long bodyLength, byte[] bufferData) {
+            this.bodyLength = bodyLength;
+            this.bufferData = bufferData;
+        }
+    }
+
+    /**
+     * Compress a byte array using the given compression info, producing Arrow-compatible compressed
+     * output.
+     *
+     * <p>Arrow compressed buffer format: [4 bytes: uncompressed length (little-endian)][compressed
+     * data]
+     *
+     * <p>We use the underlying Zstd/LZ4 library directly to avoid ArrowBuf lifecycle management
+     * issues with Arrow's CompressionCodec API.
+     */
+    private byte[] compressBuffer(byte[] data, ArrowCompressionInfo compressionInfo) {
+        switch (compressionInfo.getCompressionType()) {
+            case ZSTD:
+                return compressZstd(data, compressionInfo.getCompressionLevel());
+            case LZ4_FRAME:
+                return compressLz4(data);
+            case NONE:
+                return data;
+            default:
+                throw new IllegalArgumentException(
+                        "Unsupported compression type: " + compressionInfo.getCompressionType());
+        }
+    }
+
+    private byte[] compressZstd(byte[] data, int compressionLevel) {
+        long maxCompressedSize = Zstd.compressBound(data.length);
+        if (Zstd.isError(maxCompressedSize)) {
+            throw new RuntimeException(
+                    "Zstd compress bound error: " + Zstd.getErrorName(maxCompressedSize));
+        }
+        // Arrow compressed format: [4 bytes uncompressed length (little-endian)][compressed data]
+        int sizeOfUncompressedLength = (int) CompressionUtil.SIZE_OF_UNCOMPRESSED_LENGTH;
+        byte[] output = new byte[sizeOfUncompressedLength + (int) maxCompressedSize];
+        // Write uncompressed length in little-endian
+        output[0] = (byte) data.length;
+        output[1] = (byte) (data.length >> 8);
+        output[2] = (byte) (data.length >> 16);
+        output[3] = (byte) (data.length >> 24);
+        long compressedSize =
+                Zstd.compressByteArray(
+                        output,
+                        sizeOfUncompressedLength,
+                        (int) maxCompressedSize,
+                        data,
+                        0,
+                        data.length,
+                        compressionLevel);
+        if (Zstd.isError(compressedSize)) {
+            throw new RuntimeException(
+                    "Zstd compression error: " + Zstd.getErrorName(compressedSize));
+        }
+        byte[] result = new byte[sizeOfUncompressedLength + (int) compressedSize];
+        System.arraycopy(output, 0, result, 0, result.length);
+        return result;
+    }
+
+    private byte[] compressLz4(byte[] data) {
+        // Use FlussLZ4BlockOutputStream directly to compress the data
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try {
+            // Write uncompressed length in little-endian (Arrow compressed format header)
+            int sizeOfUncompressedLength = (int) CompressionUtil.SIZE_OF_UNCOMPRESSED_LENGTH;
+            byte[] lengthBytes = new byte[sizeOfUncompressedLength];
+            lengthBytes[0] = (byte) data.length;
+            lengthBytes[1] = (byte) (data.length >> 8);
+            lengthBytes[2] = (byte) (data.length >> 16);
+            lengthBytes[3] = (byte) (data.length >> 24);
+            baos.write(lengthBytes);
+
+            // Compress data using LZ4 block format
+            ByteArrayInputStream bais = new ByteArrayInputStream(data);
+            try (InputStream in = bais;
+                    OutputStream out = new FlussLZ4BlockOutputStream(baos)) {
+                IOUtils.copyBytes(in, out);
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("LZ4 compression failed", e);
+        }
+        return baos.toByteArray();
+    }
+
+    /** Flatten fields recursively for NULL column schema (all fields are selected). */
+    private void flattenNullFields(List<Field> fields, List<Field> flattened) {
+        for (Field field : fields) {
+            flattened.add(field);
+            if (!field.getChildren().isEmpty()) {
+                flattenNullFields(field.getChildren(), flattened);
+            }
+        }
     }
 
     /**
@@ -425,12 +677,8 @@ public class FileLogProjection {
                         "The projection indexes should not contain duplicated fields, but is "
                                 + Arrays.toString(selectedIndexes));
             } else if (i >= length) {
-                throw new InvalidColumnProjectionException(
-                        "Projected fields "
-                                + Arrays.toString(selectedIndexes)
-                                + " is out of bound for schema with "
-                                + length
-                                + " fields.");
+                // Newly added column not present in old schema; will append NULL vector later.
+                continue;
             }
             bitset.set(i);
             prev = i;
@@ -503,6 +751,14 @@ public class FileLogProjection {
     private ProjectionInfo createProjectionInfo(short schemaId, int[] selectedFieldPositions) {
         org.apache.fluss.metadata.Schema schema = schemaGetter.getSchema(schemaId);
         RowType rowType = schema.getRowType();
+        int oldFieldCount = rowType.getFieldCount();
+
+        // Split selectedFieldPositions into fields that exist in the old schema and fields
+        // that are missing (newly added columns via schema evolution).
+        int[] existingFields =
+                Arrays.stream(selectedFieldPositions).filter(i -> i < oldFieldCount).toArray();
+        int[] missingFields =
+                Arrays.stream(selectedFieldPositions).filter(i -> i >= oldFieldCount).toArray();
 
         // initialize the projection util information
         Schema arrowSchema = ArrowUtils.toArrowSchema(rowType);
@@ -529,19 +785,59 @@ public class FileLogProjection {
             bufferIndex += bufferLayoutCount[i];
         }
 
-        Schema projectedArrowSchema =
-                ArrowUtils.toArrowSchema(rowType.project(selectedFieldPositions));
+        // Build the projected Arrow schema for existing fields only
+        Schema projectedArrowSchema;
+        if (existingFields.length > 0) {
+            projectedArrowSchema = ArrowUtils.toArrowSchema(rowType.project(existingFields));
+        } else {
+            // All projected fields are missing from the old schema
+            projectedArrowSchema = new Schema(Collections.emptyList());
+        }
+
+        // Build the NULL columns Arrow schema for missing fields (from the latest schema)
+        Schema nullColumnsArrowSchema = null;
+        if (missingFields.length > 0) {
+            org.apache.fluss.metadata.Schema latestSchema = schemaGetter.getSchema(targetSchemaId);
+            RowType latestRowType = latestSchema.getRowType();
+            // Validate that missing fields are within the latest schema's range
+            for (int missingField : missingFields) {
+                if (missingField >= latestRowType.getFieldCount()) {
+                    throw new InvalidColumnProjectionException(
+                            "Projected fields "
+                                    + Arrays.toString(selectedFieldPositions)
+                                    + " is out of bound for schema with "
+                                    + latestRowType.getFieldCount()
+                                    + " fields.");
+                }
+            }
+            nullColumnsArrowSchema = ArrowUtils.toArrowSchema(latestRowType.project(missingFields));
+        }
+
         ArrowBodyCompression bodyCompression =
                 CompressionUtil.createBodyCompression(compressionInfo.createCompressionCodec());
+
+        // Estimate metadata length using the combined schema (existing + NULL columns),
+        // since adding two independent estimates would double-count flatbuffers overhead.
+        Schema combinedSchema;
+        if (nullColumnsArrowSchema != null) {
+            List<Field> combinedFields = new ArrayList<>(projectedArrowSchema.getFields());
+            combinedFields.addAll(nullColumnsArrowSchema.getFields());
+            combinedSchema = new Schema(combinedFields);
+        } else {
+            combinedSchema = projectedArrowSchema;
+        }
         int metadataLength =
-                ArrowUtils.estimateArrowMetadataLength(projectedArrowSchema, bodyCompression);
+                ArrowUtils.estimateArrowMetadataLength(combinedSchema, bodyCompression);
         return new ProjectionInfo(
                 nodesProjection,
                 buffersProjection,
                 bufferIndex,
                 metadataLength,
                 bodyCompression,
-                selectedFieldPositions);
+                selectedFieldPositions,
+                existingFields,
+                missingFields,
+                nullColumnsArrowSchema);
     }
 
     /** Projection pushdown information for a specific schema and selected fields. */
@@ -553,19 +849,37 @@ public class FileLogProjection {
         final ArrowBodyCompression bodyCompression;
         final int[] selectedFieldPositions;
 
+        /** Field indexes in selectedFieldPositions that exist in the old schema. */
+        final int[] existingFields;
+
+        /**
+         * Field indexes in selectedFieldPositions that are missing from the old schema (newly added
+         * columns via schema evolution).
+         */
+        final int[] missingFields;
+
+        /** Arrow schema of the missing columns, used to construct NULL column vectors. */
+        @Nullable final Schema nullColumnsArrowSchema;
+
         private ProjectionInfo(
                 BitSet nodesProjection,
                 BitSet buffersProjection,
                 int bufferCount,
                 int arrowMetadataLength,
                 ArrowBodyCompression bodyCompression,
-                int[] selectedFieldPositions) {
+                int[] selectedFieldPositions,
+                int[] existingFields,
+                int[] missingFields,
+                @Nullable Schema nullColumnsArrowSchema) {
             this.nodesProjection = nodesProjection;
             this.buffersProjection = buffersProjection;
             this.bufferCount = bufferCount;
             this.arrowMetadataLength = arrowMetadataLength;
             this.bodyCompression = bodyCompression;
             this.selectedFieldPositions = selectedFieldPositions;
+            this.existingFields = existingFields;
+            this.missingFields = missingFields;
+            this.nullColumnsArrowSchema = nullColumnsArrowSchema;
         }
     }
 
@@ -583,15 +897,25 @@ public class FileLogProjection {
         /** The projected buffer positions of {@link ArrowRecordBatch#getBuffers()}. */
         final List<ArrowBuffer> buffers;
 
+        /** Total body length of NULL column buffers (validity bitmaps with all-zero bits). */
+        final long nullColumnsBodyLength;
+
+        /** Compressed NULL column buffer data to append to the body. */
+        @Nullable final byte[] nullColumnCompressedData;
+
         public ProjectedArrowBatch(
                 long numRecords,
                 List<ArrowFieldNode> nodes,
                 List<ArrowBuffer> buffersLayout,
-                List<ArrowBuffer> buffers) {
+                List<ArrowBuffer> buffers,
+                long nullColumnsBodyLength,
+                @Nullable byte[] nullColumnCompressedData) {
             this.numRecords = numRecords;
             this.nodes = nodes;
             this.buffersLayout = buffersLayout;
             this.buffers = buffers;
+            this.nullColumnsBodyLength = nullColumnsBodyLength;
+            this.nullColumnCompressedData = nullColumnCompressedData;
         }
 
         public long bodyLength() {
@@ -599,6 +923,7 @@ public class FileLogProjection {
             for (ArrowBuffer buffer : buffers) {
                 bodyLength += buffer.getSize();
             }
+            bodyLength += nullColumnsBodyLength;
             return bodyLength;
         }
     }

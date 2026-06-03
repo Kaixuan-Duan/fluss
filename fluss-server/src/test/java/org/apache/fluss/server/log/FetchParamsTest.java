@@ -45,7 +45,8 @@ class FetchParamsTest {
                 new TestingSchemaGetter(new SchemaInfo(TestData.DATA1_SCHEMA, (short) 1)),
                 DEFAULT_COMPRESSION,
                 null,
-                projectionCache);
+                projectionCache,
+                1);
         assertThat(fetchParams.fetchOffset()).isEqualTo(20L);
         assertThat(fetchParams.maxFetchBytes()).isEqualTo(1024);
         assertThat(fetchParams.projection()).isNull();
@@ -57,7 +58,8 @@ class FetchParamsTest {
                 new TestingSchemaGetter(new SchemaInfo(TestData.DATA2_SCHEMA, (short) 1)),
                 DEFAULT_COMPRESSION,
                 new int[] {0, 2},
-                projectionCache);
+                projectionCache,
+                1);
         assertThat(fetchParams.fetchOffset()).isEqualTo(30L);
         assertThat(fetchParams.maxFetchBytes()).isEqualTo(512);
         assertThat(fetchParams.projection()).isNotNull();
@@ -71,7 +73,8 @@ class FetchParamsTest {
                 new TestingSchemaGetter(new SchemaInfo(TestData.DATA1_SCHEMA, (short) 1)),
                 DEFAULT_COMPRESSION,
                 null,
-                projectionCache);
+                projectionCache,
+                1);
         assertThat(fetchParams.projection()).isNull();
 
         fetchParams.setCurrentFetch(
@@ -81,7 +84,8 @@ class FetchParamsTest {
                 new TestingSchemaGetter(new SchemaInfo(TestData.DATA2_SCHEMA, (short) 1)),
                 DEFAULT_COMPRESSION,
                 new int[] {0, 2},
-                projectionCache);
+                projectionCache,
+                1);
         // the FileLogProjection should be cached
         assertThat(fetchParams.projection()).isNotNull().isSameAs(prevProjection);
     }

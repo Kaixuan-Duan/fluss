@@ -767,7 +767,8 @@ final class LogSegmentTest extends LogTestBase {
                 1L,
                 TEST_SCHEMA_GETTER,
                 org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION,
-                new int[] {0});
+                new int[] {0},
+                DEFAULT_SCHEMA_ID);
 
         try (LogRecordReadContext readContext =
                 LogRecordReadContext.createArrowReadContext(
@@ -829,7 +830,8 @@ final class LogSegmentTest extends LogTestBase {
                 1L,
                 TEST_SCHEMA_GETTER,
                 org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION,
-                new int[] {0});
+                new int[] {0},
+                DEFAULT_SCHEMA_ID);
 
         try (LogRecordReadContext readContext =
                 LogRecordReadContext.createArrowReadContext(
@@ -935,7 +937,8 @@ final class LogSegmentTest extends LogTestBase {
                 1L,
                 TEST_SCHEMA_GETTER,
                 org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION,
-                new int[] {0});
+                new int[] {0},
+                DEFAULT_SCHEMA_ID);
 
         int unprojectedBatch1Size = batch1.sizeInBytes();
 
