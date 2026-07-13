@@ -26,6 +26,7 @@ import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
+import org.apache.fluss.metadata.TablePartition;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.encode.KeyEncoder;
 import org.apache.fluss.types.RowType;
@@ -127,6 +128,7 @@ class PrimaryKeyLookuper extends AbstractLookuper implements Lookuper {
         int bucketId = bucketingFunction.bucketing(bkBytes, numBuckets);
         Long partitionId = null;
         String originalPartitionName = null;
+        int effectiveNumBuckets = numBuckets;
         if (partitionGetter != null) {
             originalPartitionName = partitionGetter.getPartition(lookupKey);
             if (confirmedHistoricalPartitions.contains(originalPartitionName)) {
@@ -139,11 +141,23 @@ class PrimaryKeyLookuper extends AbstractLookuper implements Lookuper {
                                 partitionGetter,
                                 tableInfo.getTablePath(),
                                 metadataUpdater);
+                if (partitionId != null) {
+                    effectiveNumBuckets =
+                            resolvePartitionBucketCount(
+                                    new TablePartition(tableInfo.getTableId(), partitionId),
+                                    numBuckets);
+                }
             } catch (PartitionNotExistException e) {
                 return mayFallbackToHistoricalLookup(bucketId, pkBytes, originalPartitionName);
             }
         }
 
+        // A partition created before ALTER bucket.num keeps its own layout, so re-route by the
+        // partition's actual count. The historical lookups above keep the table-level bucketId
+        // because the historical partition is resolved on its own path.
+        if (effectiveNumBuckets != numBuckets) {
+            bucketId = bucketingFunction.bucketing(bkBytes, effectiveNumBuckets);
+        }
         TableBucket tableBucket = new TableBucket(tableInfo.getTableId(), partitionId, bucketId);
         return lookupBucket(tableBucket, pkBytes, insertIfNotExists, false, originalPartitionName);
     }

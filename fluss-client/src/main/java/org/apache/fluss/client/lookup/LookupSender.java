@@ -253,7 +253,8 @@ class LookupSender implements Runnable {
                                         lookupsByBatchKeyInRequest.values(),
                                         insertIfNotExists,
                                         acks,
-                                        maxRequestTimeoutMs),
+                                        maxRequestTimeoutMs,
+                                        metadataUpdater.getCluster()),
                                 tableId,
                                 lookupsByBatchKeyInRequest);
                     }
@@ -322,7 +323,10 @@ class LookupSender implements Runnable {
                         sendPrefixLookupRequestAndHandleResponse(
                                 destination,
                                 gateway,
-                                makePrefixLookupRequest(tableId, prefixLookupBatch.values()),
+                                makePrefixLookupRequest(
+                                        tableId,
+                                        prefixLookupBatch.values(),
+                                        metadataUpdater.getCluster()),
                                 tableId,
                                 prefixLookupBatch));
     }

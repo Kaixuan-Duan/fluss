@@ -1123,7 +1123,8 @@ final class SenderTest {
                 reties,
                 metadataUpdater,
                 idempotenceManager,
-                writerMetricGroup);
+                writerMetricGroup,
+                tb -> {});
     }
 
     private IdempotenceManager createIdempotenceManager(boolean idempotenceEnabled) {
