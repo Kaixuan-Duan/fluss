@@ -17,6 +17,7 @@
 
 package org.apache.fluss.flink.sink.writer;
 
+import org.apache.fluss.client.table.writer.Append;
 import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.client.table.writer.TableWriter;
 import org.apache.fluss.config.Configuration;
@@ -45,14 +46,35 @@ public class AppendSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
             RowType tableRowType,
             MailboxExecutor mailboxExecutor,
             FlussSerializationSchema<InputT> serializationSchema) {
-        super(tablePath, flussConfig, tableRowType, mailboxExecutor, serializationSchema);
+        this(tablePath, flussConfig, tableRowType, mailboxExecutor, serializationSchema, null);
+    }
+
+    public AppendSinkWriter(
+            TablePath tablePath,
+            Configuration flussConfig,
+            RowType tableRowType,
+            MailboxExecutor mailboxExecutor,
+            FlussSerializationSchema<InputT> serializationSchema,
+            String fixedPartitionName) {
+        super(
+                tablePath,
+                flussConfig,
+                tableRowType,
+                null,
+                mailboxExecutor,
+                serializationSchema,
+                fixedPartitionName);
     }
 
     @Override
     public void initialize(SinkWriterMetricGroup metricGroup) {
         super.initialize(metricGroup);
 
-        appendWriter = table.newAppend().createWriter();
+        Append append = table.newAppend();
+        if (fixedPartitionName != null) {
+            append = append.toPartition(fixedPartitionName);
+        }
+        appendWriter = append.createWriter();
         LOG.info("Finished opening Fluss {}.", this.getClass().getSimpleName());
     }
 

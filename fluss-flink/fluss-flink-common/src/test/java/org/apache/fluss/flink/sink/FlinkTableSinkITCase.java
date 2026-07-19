@@ -19,12 +19,14 @@ package org.apache.fluss.flink.sink;
 
 import org.apache.fluss.client.Connection;
 import org.apache.fluss.client.ConnectionFactory;
+import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.client.table.Table;
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.scanner.log.LogScanner;
 import org.apache.fluss.client.table.scanner.log.ScanRecords;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.sink.shuffle.DistributionMode;
+import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
@@ -827,6 +829,219 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
                 .await();
         assertResultsIgnoreOrder(
                 rowIter, Arrays.asList("+I[22, 2222, 2030]", "+I[33, 3333, 2030]"), true);
+    }
+
+    /**
+     * INSERT OVERWRITE new-partition PoC verification. Writes into an existing partition using
+     * INSERT OVERWRITE; the PoC routes the write into a fresh internal-name partition ({@code
+     * <origin>_ow_<millis>}) while each row keeps its original partition-column value. Verifies:
+     * (a) a new internal-name partition is created holding the written rows, (b) the partition
+     * column value in that new partition is the ORIGINAL value (not the internal name), and (c) the
+     * original partition's physical data is untouched.
+     */
+    @Test
+    void testInsertOverwriteIntoNewPartition() throws Exception {
+        String tableName = "ow_new_partition_log_table";
+        TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
+        String originPartition = "2030";
+
+        tEnv.executeSql(
+                String.format(
+                        "create table %s ("
+                                + "a int not null,"
+                                + " b bigint, "
+                                + "c string"
+                                + ")"
+                                + " partitioned by (c) "
+                                + "with ('bucket.num' = '1')",
+                        tableName));
+
+        // create the origin partition and write the original data into it
+        tEnv.executeSql(
+                String.format(
+                        "alter table %s add partition (c = '%s')", tableName, originPartition));
+        waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath, 1);
+
+        tEnv.executeSql(
+                        String.format(
+                                "INSERT INTO %s(a, b, c) VALUES (1, 1001, '%s'), (2, 1002, '%s')",
+                                tableName, originPartition, originPartition))
+                .await();
+
+        // record the origin partition id and its data before overwrite
+        Configuration clientConf = FLUSS_CLUSTER_EXTENSION.getClientConfig();
+        long originPartitionId;
+        List<String> originRowsBeforeOw;
+        try (Connection conn = ConnectionFactory.createConnection(clientConf)) {
+            Admin admin = conn.getAdmin();
+            originPartitionId = findPartitionId(admin, tablePath, originPartition);
+            originRowsBeforeOw = readPartitionRows(conn, tablePath, originPartitionId, 2);
+        }
+        assertThat(originRowsBeforeOw)
+                .containsExactlyInAnyOrder("+I[1, 1001, 2030]", "+I[2, 1002, 2030]");
+
+        // INSERT OVERWRITE into the origin partition; PoC routes it into a new internal-name
+        // partition, keeping the rows' partition column value = originPartition. Using VALUES with
+        // a static partition (rather than SELECT from the same table) keeps this a bounded job.
+        tEnv.executeSql(
+                        String.format(
+                                "INSERT OVERWRITE %s PARTITION (c = '%s') VALUES (1, 1001), (2, 1002)",
+                                tableName, originPartition))
+                .await();
+
+        try (Connection conn = ConnectionFactory.createConnection(clientConf)) {
+            Admin admin = conn.getAdmin();
+            List<PartitionInfo> partitions = admin.listPartitionInfos(tablePath).get();
+
+            // a new internal-name partition <origin>_ow_<millis> should exist
+            PartitionInfo internalPartition =
+                    partitions.stream()
+                            .filter(p -> p.getPartitionName().startsWith(originPartition + "_ow_"))
+                            .findFirst()
+                            .orElseThrow(
+                                    () ->
+                                            new AssertionError(
+                                                    "No internal overwrite partition found, got: "
+                                                            + partitions.stream()
+                                                                    .map(
+                                                                            PartitionInfo
+                                                                                    ::getPartitionName)
+                                                                    .collect(Collectors.toList())));
+
+            // (a)+(b) the new partition holds the written rows with ORIGINAL partition value
+            List<String> newPartitionRows =
+                    readPartitionRows(conn, tablePath, internalPartition.getPartitionId(), 2);
+            assertThat(newPartitionRows)
+                    .containsExactlyInAnyOrder("+I[1, 1001, 2030]", "+I[2, 1002, 2030]");
+
+            // (c) the origin partition's physical data is untouched
+            List<String> originRowsAfterOw =
+                    readPartitionRows(conn, tablePath, originPartitionId, 2);
+            assertThat(originRowsAfterOw).containsExactlyInAnyOrderElementsOf(originRowsBeforeOw);
+        }
+    }
+
+    /**
+     * INSERT OVERWRITE new-partition PoC verification for a PRIMARY KEY (upsert) partitioned table.
+     * Mirrors {@link #testInsertOverwriteIntoNewPartition} but exercises the upsert write path
+     * ({@code Upsert.toPartition}) instead of the append path. The primary key must include the
+     * partition key, so the PK is (a, c). Verifies the new internal-name partition holds the
+     * upserted rows with the ORIGINAL partition-column value, and the origin partition is
+     * untouched.
+     */
+    @Test
+    void testInsertOverwriteIntoNewPartitionForPkTable() throws Exception {
+        String tableName = "ow_new_partition_pk_table";
+        TablePath tablePath = TablePath.of(DEFAULT_DB, tableName);
+        String originPartition = "2030";
+
+        tEnv.executeSql(
+                String.format(
+                        "create table %s ("
+                                + "a int not null,"
+                                + " b bigint, "
+                                + "c string,"
+                                + " primary key (a, c) not enforced"
+                                + ")"
+                                + " partitioned by (c) "
+                                + "with ('bucket.num' = '1')",
+                        tableName));
+
+        // create the origin partition and upsert the original data into it
+        tEnv.executeSql(
+                String.format(
+                        "alter table %s add partition (c = '%s')", tableName, originPartition));
+        waitUntilPartitions(FLUSS_CLUSTER_EXTENSION.getZooKeeperClient(), tablePath, 1);
+
+        tEnv.executeSql(
+                        String.format(
+                                "INSERT INTO %s(a, b, c) VALUES (1, 1001, '%s'), (2, 1002, '%s')",
+                                tableName, originPartition, originPartition))
+                .await();
+
+        // record the origin partition id and its data before overwrite
+        Configuration clientConf = FLUSS_CLUSTER_EXTENSION.getClientConfig();
+        long originPartitionId;
+        List<String> originRowsBeforeOw;
+        try (Connection conn = ConnectionFactory.createConnection(clientConf)) {
+            Admin admin = conn.getAdmin();
+            originPartitionId = findPartitionId(admin, tablePath, originPartition);
+            originRowsBeforeOw = readPartitionRows(conn, tablePath, originPartitionId, 2);
+        }
+        assertThat(originRowsBeforeOw)
+                .containsExactlyInAnyOrder("+I[1, 1001, 2030]", "+I[2, 1002, 2030]");
+
+        // INSERT OVERWRITE into the origin partition; PoC routes it into a new internal-name
+        // partition through the upsert write path, keeping the rows' partition column value.
+        tEnv.executeSql(
+                        String.format(
+                                "INSERT OVERWRITE %s PARTITION (c = '%s') VALUES (1, 1001), (2, 1002)",
+                                tableName, originPartition))
+                .await();
+
+        try (Connection conn = ConnectionFactory.createConnection(clientConf)) {
+            Admin admin = conn.getAdmin();
+            List<PartitionInfo> partitions = admin.listPartitionInfos(tablePath).get();
+
+            // a new internal-name partition <origin>_ow_<millis> should exist
+            PartitionInfo internalPartition =
+                    partitions.stream()
+                            .filter(p -> p.getPartitionName().startsWith(originPartition + "_ow_"))
+                            .findFirst()
+                            .orElseThrow(
+                                    () ->
+                                            new AssertionError(
+                                                    "No internal overwrite partition found, got: "
+                                                            + partitions.stream()
+                                                                    .map(
+                                                                            PartitionInfo
+                                                                                    ::getPartitionName)
+                                                                    .collect(Collectors.toList())));
+
+            // the new partition holds the upserted rows with ORIGINAL partition value
+            List<String> newPartitionRows =
+                    readPartitionRows(conn, tablePath, internalPartition.getPartitionId(), 2);
+            assertThat(newPartitionRows)
+                    .containsExactlyInAnyOrder("+I[1, 1001, 2030]", "+I[2, 1002, 2030]");
+
+            // the origin partition's physical data is untouched
+            List<String> originRowsAfterOw =
+                    readPartitionRows(conn, tablePath, originPartitionId, 2);
+            assertThat(originRowsAfterOw).containsExactlyInAnyOrderElementsOf(originRowsBeforeOw);
+        }
+    }
+
+    private static long findPartitionId(Admin admin, TablePath tablePath, String partitionName)
+            throws Exception {
+        for (PartitionInfo partitionInfo : admin.listPartitionInfos(tablePath).get()) {
+            if (partitionInfo.getPartitionName().equals(partitionName)) {
+                return partitionInfo.getPartitionId();
+            }
+        }
+        throw new IllegalStateException("Partition not found: " + partitionName);
+    }
+
+    /** Read all rows of a single partition (bucket 0) via the Fluss log scanner. */
+    private static List<String> readPartitionRows(
+            Connection conn, TablePath tablePath, long partitionId, int expectedCount)
+            throws Exception {
+        List<String> rows = new ArrayList<>();
+        try (Table table = conn.getTable(tablePath);
+                LogScanner logScanner = table.newScan().createLogScanner()) {
+            logScanner.subscribeFromBeginning(partitionId, 0);
+            while (rows.size() < expectedCount) {
+                ScanRecords scanRecords = logScanner.poll(Duration.ofSeconds(1));
+                for (TableBucket bucket : scanRecords.buckets()) {
+                    for (ScanRecord record : scanRecords.records(bucket)) {
+                        InternalRow row = record.getRow();
+                        rows.add(
+                                Row.of(row.getInt(0), row.getLong(1), row.getString(2).toString())
+                                        .toString());
+                    }
+                }
+            }
+        }
+        return rows;
     }
 
     @Test

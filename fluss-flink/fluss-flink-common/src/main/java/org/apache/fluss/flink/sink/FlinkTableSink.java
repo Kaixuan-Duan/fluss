@@ -17,6 +17,9 @@
 
 package org.apache.fluss.flink.sink;
 
+import org.apache.fluss.client.Connection;
+import org.apache.fluss.client.ConnectionFactory;
+import org.apache.fluss.client.admin.Admin;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.sink.serializer.RowDataSerializationSchema;
 import org.apache.fluss.flink.sink.shuffle.DistributionMode;
@@ -27,6 +30,8 @@ import org.apache.fluss.flink.utils.PushdownUtils.ValueConversion;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.MergeEngineType;
+import org.apache.fluss.metadata.PartitionInfo;
+import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.GenericRow;
 
@@ -41,6 +46,7 @@ import org.apache.flink.table.connector.RowLevelModificationScanContext;
 import org.apache.flink.table.connector.sink.DataStreamSinkProvider;
 import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.sink.abilities.SupportsDeletePushDown;
+import org.apache.flink.table.connector.sink.abilities.SupportsOverwrite;
 import org.apache.flink.table.connector.sink.abilities.SupportsPartitioning;
 import org.apache.flink.table.connector.sink.abilities.SupportsRowLevelDelete;
 import org.apache.flink.table.connector.sink.abilities.SupportsRowLevelUpdate;
@@ -56,6 +62,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -68,6 +75,7 @@ import static org.apache.fluss.flink.utils.PushdownUtils.extractFieldEquals;
 public class FlinkTableSink
         implements DynamicTableSink,
                 SupportsPartitioning,
+                SupportsOverwrite,
                 SupportsDeletePushDown,
                 SupportsRowLevelDelete,
                 SupportsRowLevelUpdate {
@@ -89,6 +97,11 @@ public class FlinkTableSink
 
     private boolean appliedUpdates = false;
     @Nullable private GenericRow deleteRow;
+
+    // INSERT OVERWRITE new-partition PoC: set when the SQL is INSERT OVERWRITE, and the target
+    // partition captured from applyStaticPartition (e.g. {dt=2030}).
+    private boolean overwrite = false;
+    @Nullable private Map<String, String> staticPartitionSpec;
 
     public FlinkTableSink(
             TablePath tablePath,
@@ -210,6 +223,10 @@ public class FlinkTableSink
         // Enable undo recovery for aggregation tables
         boolean enableUndoRecovery = mergeEngineType == MergeEngineType.AGGREGATION;
 
+        // INSERT OVERWRITE new-partition PoC: create an internal-name partition at compile time and
+        // route all rows to it. The rows keep their original partition column value.
+        String fixedPartitionName = overwrite ? createOverwritePartition() : null;
+
         FlinkSink.SinkWriterBuilder<? extends FlinkSinkWriter, RowData> flinkSinkWriterBuilder =
                 (primaryKeyIndexes.length > 0)
                         ? new FlinkSink.UpsertSinkWriterBuilder<>(
@@ -224,7 +241,8 @@ public class FlinkTableSink
                                 distributionMode,
                                 new RowDataSerializationSchema(false, sinkIgnoreDelete),
                                 enableUndoRecovery,
-                                producerId)
+                                producerId,
+                                fixedPartitionName)
                         : new FlinkSink.AppendSinkWriterBuilder<>(
                                 tablePath,
                                 flussConfig,
@@ -234,9 +252,60 @@ public class FlinkTableSink
                                 partitionKeys,
                                 lakeFormat,
                                 distributionMode,
-                                new RowDataSerializationSchema(true, sinkIgnoreDelete));
+                                new RowDataSerializationSchema(true, sinkIgnoreDelete),
+                                fixedPartitionName);
 
         return new FlinkSink<>(flinkSinkWriterBuilder, tablePath);
+    }
+
+    /**
+     * INSERT OVERWRITE new-partition PoC: create a partition under an internal logical name (used
+     * only as an addressing shell so the physical object can come online and accept writes), and
+     * return that internal name. The internal name is derived from the target partition value(s)
+     * plus a unique suffix, and stays within the partition-name char whitelist ([A-Za-z0-9_-]).
+     */
+    private String createOverwritePartition() {
+        if (partitionKeys.isEmpty()) {
+            throw new UnsupportedOperationException(
+                    "INSERT OVERWRITE new-partition PoC only supports partitioned tables.");
+        }
+        if (staticPartitionSpec == null || staticPartitionSpec.isEmpty()) {
+            throw new UnsupportedOperationException(
+                    "INSERT OVERWRITE new-partition PoC requires a static target partition, "
+                            + "e.g. INSERT OVERWRITE t PARTITION (dt='2030') ...");
+        }
+
+        // build the internal partition value for each partition key: <origin>_ow_<millis>
+        long suffix = System.currentTimeMillis();
+        Map<String, String> internalSpecMap = new LinkedHashMap<>();
+        for (String partitionKey : partitionKeys) {
+            String originValue = staticPartitionSpec.get(partitionKey);
+            if (originValue == null) {
+                throw new UnsupportedOperationException(
+                        String.format(
+                                "INSERT OVERWRITE new-partition PoC requires all partition keys to "
+                                        + "be specified. Missing value for partition key '%s'.",
+                                partitionKey));
+            }
+            internalSpecMap.put(partitionKey, originValue + "_ow_" + suffix);
+        }
+        PartitionSpec internalSpec = new PartitionSpec(internalSpecMap);
+
+        try (Connection connection = ConnectionFactory.createConnection(flussConfig)) {
+            Admin admin = connection.getAdmin();
+            admin.createPartition(tablePath, internalSpec, false).get();
+            // reverse-look up the created partition to obtain its resolved name
+            for (PartitionInfo partitionInfo : admin.listPartitionInfos(tablePath).get()) {
+                if (partitionInfo.getPartitionSpec().equals(internalSpec)) {
+                    return partitionInfo.getPartitionName();
+                }
+            }
+            throw new IllegalStateException(
+                    "Failed to find the created overwrite partition " + internalSpec);
+        } catch (Exception e) {
+            throw new org.apache.fluss.exception.FlussRuntimeException(
+                    "Failed to create overwrite partition " + internalSpec, e);
+        }
     }
 
     private List<String> columns(int[] columnIndexes) {
@@ -267,6 +336,8 @@ public class FlinkTableSink
                         producerId);
         sink.appliedUpdates = appliedUpdates;
         sink.deleteRow = deleteRow;
+        sink.overwrite = overwrite;
+        sink.staticPartitionSpec = staticPartitionSpec;
         return sink;
     }
 
@@ -277,7 +348,14 @@ public class FlinkTableSink
 
     @Override
     public void applyStaticPartition(Map<String, String> partition) {
-        // do nothing
+        // capture the target partition; used by the INSERT OVERWRITE new-partition PoC to derive
+        // the internal partition name and to keep the rows' original partition value.
+        this.staticPartitionSpec = partition;
+    }
+
+    @Override
+    public void applyOverwrite(boolean overwrite) {
+        this.overwrite = overwrite;
     }
 
     @Override

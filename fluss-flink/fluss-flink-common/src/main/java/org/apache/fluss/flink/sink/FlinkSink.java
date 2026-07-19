@@ -124,6 +124,7 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
         private final @Nullable DataLakeFormat lakeFormat;
         private final DistributionMode distributionMode;
         private final FlussSerializationSchema<InputT> flussSerializationSchema;
+        private final @Nullable String fixedPartitionName;
 
         public AppendSinkWriterBuilder(
                 TablePath tablePath,
@@ -134,7 +135,8 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
                 List<String> partitionKeys,
                 @Nullable DataLakeFormat lakeFormat,
                 DistributionMode distributionMode,
-                FlussSerializationSchema<InputT> flussSerializationSchema) {
+                FlussSerializationSchema<InputT> flussSerializationSchema,
+                @Nullable String fixedPartitionName) {
             this.tablePath = tablePath;
             this.flussConfig = flussConfig;
             this.tableRowType = tableRowType;
@@ -144,10 +146,20 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
             this.lakeFormat = lakeFormat;
             this.distributionMode = distributionMode;
             this.flussSerializationSchema = flussSerializationSchema;
+            this.fixedPartitionName = fixedPartitionName;
         }
 
         @Override
         public AppendSinkWriter<InputT> createWriter(MailboxExecutor mailboxExecutor) {
+            if (fixedPartitionName != null) {
+                return new AppendSinkWriter<>(
+                        tablePath,
+                        flussConfig,
+                        tableRowType,
+                        mailboxExecutor,
+                        flussSerializationSchema,
+                        fixedPartitionName);
+            }
             return new AppendSinkWriter<>(
                     tablePath,
                     flussConfig,
@@ -251,6 +263,7 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
         private final FlussSerializationSchema<InputT> flussSerializationSchema;
         private final boolean enableUndoRecovery;
         @Nullable private final String producerId;
+        @Nullable private final String fixedPartitionName;
 
         /**
          * Optional context for reporting offsets to the upstream UndoRecoveryOperator.
@@ -276,7 +289,8 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
                 DistributionMode distributionMode,
                 FlussSerializationSchema<InputT> flussSerializationSchema,
                 boolean enableUndoRecovery,
-                @Nullable String producerId) {
+                @Nullable String producerId,
+                @Nullable String fixedPartitionName) {
             this.tablePath = tablePath;
             this.flussConfig = flussConfig;
             this.tableRowType = tableRowType;
@@ -289,6 +303,7 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
             this.flussSerializationSchema = flussSerializationSchema;
             this.enableUndoRecovery = enableUndoRecovery;
             this.producerId = producerId;
+            this.fixedPartitionName = fixedPartitionName;
         }
 
         @Override
@@ -300,7 +315,8 @@ class FlinkSink<InputT> extends SinkAdapter<InputT> {
                     targetColumnIndexes,
                     mailboxExecutor,
                     flussSerializationSchema,
-                    offsetReporter);
+                    offsetReporter,
+                    fixedPartitionName);
         }
 
         @Override

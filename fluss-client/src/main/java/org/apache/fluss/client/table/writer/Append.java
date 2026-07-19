@@ -29,8 +29,17 @@ import org.apache.fluss.annotation.PublicEvolving;
 @PublicEvolving
 public interface Append {
 
-    // TODO: Add more methods to configure the AppendWriter, such as apply static partitions,
-    //  apply overwrites, etc.
+    /**
+     * Route all appended rows to the given partition, regardless of the value of their partition
+     * column(s), and return a new {@link Append} instance.
+     *
+     * <p>This is used by the INSERT OVERWRITE new-partition PoC, where a new partition (registered
+     * under an internal logical name) is filled with data whose partition column keeps its original
+     * value.
+     *
+     * @param partitionName the target partition name to write into
+     */
+    Append toPartition(String partitionName);
 
     /** Create a new {@link AppendWriter} to write data to a Log Table using InternalRow. */
     AppendWriter createWriter();

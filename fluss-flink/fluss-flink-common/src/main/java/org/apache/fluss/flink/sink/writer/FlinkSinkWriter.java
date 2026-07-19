@@ -63,6 +63,12 @@ public abstract class FlinkSinkWriter<InputT> implements SinkWriter<InputT> {
     private final MailboxExecutor mailboxExecutor;
     private final FlussSerializationSchema<InputT> serializationSchema;
 
+    /**
+     * When set, the underlying table writer routes every row to this partition regardless of the
+     * row's own partition column value. Used by the INSERT OVERWRITE new-partition PoC.
+     */
+    protected final @Nullable String fixedPartitionName;
+
     private transient Connection connection;
     protected transient Table table;
     protected transient FlinkMetricRegistry flinkMetricRegistry;
@@ -79,7 +85,14 @@ public abstract class FlinkSinkWriter<InputT> implements SinkWriter<InputT> {
             RowType tableRowType,
             MailboxExecutor mailboxExecutor,
             FlussSerializationSchema<InputT> serializationSchema) {
-        this(tablePath, flussConfig, tableRowType, null, mailboxExecutor, serializationSchema);
+        this(
+                tablePath,
+                flussConfig,
+                tableRowType,
+                null,
+                mailboxExecutor,
+                serializationSchema,
+                null);
     }
 
     public FlinkSinkWriter(
@@ -89,12 +102,31 @@ public abstract class FlinkSinkWriter<InputT> implements SinkWriter<InputT> {
             @Nullable int[] targetColumns,
             MailboxExecutor mailboxExecutor,
             FlussSerializationSchema<InputT> serializationSchema) {
+        this(
+                tablePath,
+                flussConfig,
+                tableRowType,
+                targetColumns,
+                mailboxExecutor,
+                serializationSchema,
+                null);
+    }
+
+    public FlinkSinkWriter(
+            TablePath tablePath,
+            Configuration flussConfig,
+            RowType tableRowType,
+            @Nullable int[] targetColumns,
+            MailboxExecutor mailboxExecutor,
+            FlussSerializationSchema<InputT> serializationSchema,
+            @Nullable String fixedPartitionName) {
         this.tablePath = tablePath;
         this.flussConfig = flussConfig;
         this.targetColumnIndexes = targetColumns;
         this.tableRowType = tableRowType;
         this.mailboxExecutor = mailboxExecutor;
         this.serializationSchema = serializationSchema;
+        this.fixedPartitionName = fixedPartitionName;
     }
 
     public void initialize(SinkWriterMetricGroup metricGroup) {

@@ -21,22 +21,39 @@ import org.apache.fluss.client.write.WriterClient;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 
+import javax.annotation.Nullable;
+
 /** API for configuring and creating {@link AppendWriter}. */
 public class TableAppend implements Append {
 
     private final TablePath tablePath;
     private final TableInfo tableInfo;
     private final WriterClient writerClient;
+    private final @Nullable String fixedPartitionName;
 
     public TableAppend(TablePath tablePath, TableInfo tableInfo, WriterClient writerClient) {
+        this(tablePath, tableInfo, writerClient, null);
+    }
+
+    private TableAppend(
+            TablePath tablePath,
+            TableInfo tableInfo,
+            WriterClient writerClient,
+            @Nullable String fixedPartitionName) {
         this.tablePath = tablePath;
         this.tableInfo = tableInfo;
         this.writerClient = writerClient;
+        this.fixedPartitionName = fixedPartitionName;
+    }
+
+    @Override
+    public Append toPartition(String partitionName) {
+        return new TableAppend(tablePath, tableInfo, writerClient, partitionName);
     }
 
     @Override
     public AppendWriter createWriter() {
-        return new AppendWriterImpl(tablePath, tableInfo, writerClient);
+        return new AppendWriterImpl(tablePath, tableInfo, writerClient, fixedPartitionName);
     }
 
     @Override

@@ -73,13 +73,34 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
             MailboxExecutor mailboxExecutor,
             FlussSerializationSchema<InputT> flussSerializationSchema,
             @Nullable ProducerOffsetReporter offsetReporter) {
+        this(
+                tablePath,
+                flussConfig,
+                tableRowType,
+                targetColumnIndexes,
+                mailboxExecutor,
+                flussSerializationSchema,
+                offsetReporter,
+                null);
+    }
+
+    public UpsertSinkWriter(
+            TablePath tablePath,
+            Configuration flussConfig,
+            RowType tableRowType,
+            @Nullable int[] targetColumnIndexes,
+            MailboxExecutor mailboxExecutor,
+            FlussSerializationSchema<InputT> flussSerializationSchema,
+            @Nullable ProducerOffsetReporter offsetReporter,
+            @Nullable String fixedPartitionName) {
         super(
                 tablePath,
                 flussConfig,
                 tableRowType,
                 targetColumnIndexes,
                 mailboxExecutor,
-                flussSerializationSchema);
+                flussSerializationSchema,
+                fixedPartitionName);
         this.offsetReporter = offsetReporter;
     }
 
@@ -89,6 +110,9 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
         Upsert upsert = table.newUpsert();
         if (targetColumnIndexes != null) {
             upsert = upsert.partialUpdate(targetColumnIndexes);
+        }
+        if (fixedPartitionName != null) {
+            upsert = upsert.toPartition(fixedPartitionName);
         }
         upsertWriter = upsert.createWriter();
         LOG.info("Finished opening Fluss {}.", this.getClass().getSimpleName());

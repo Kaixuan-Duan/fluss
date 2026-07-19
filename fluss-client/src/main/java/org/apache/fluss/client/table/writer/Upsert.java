@@ -98,6 +98,18 @@ public interface Upsert {
     Upsert mergeMode(MergeMode mode);
 
     /**
+     * Route all upserted/deleted rows to the given partition, regardless of the value of their
+     * partition column(s), and return a new {@link Upsert} instance.
+     *
+     * <p>This is used by the INSERT OVERWRITE new-partition PoC, where a new partition (registered
+     * under an internal logical name) is filled with data whose partition column keeps its original
+     * value.
+     *
+     * @param partitionName the target partition name to write into
+     */
+    Upsert toPartition(String partitionName);
+
+    /**
      * Create a new {@link UpsertWriter} using {@code InternalRow} with the optional {@link
      * #partialUpdate(String...)} and {@link #mergeMode(MergeMode)} information to upsert and delete
      * data to a Primary Key Table.

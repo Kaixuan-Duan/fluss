@@ -71,7 +71,17 @@ class UpsertWriterImpl extends AbstractTableWriter implements UpsertWriter {
             @Nullable int[] partialUpdateColumns,
             WriterClient writerClient,
             MergeMode mergeMode) {
-        super(tablePath, tableInfo, writerClient);
+        this(tablePath, tableInfo, partialUpdateColumns, writerClient, mergeMode, null);
+    }
+
+    UpsertWriterImpl(
+            TablePath tablePath,
+            TableInfo tableInfo,
+            @Nullable int[] partialUpdateColumns,
+            WriterClient writerClient,
+            MergeMode mergeMode,
+            @Nullable String fixedPartitionName) {
+        super(tablePath, tableInfo, writerClient, fixedPartitionName);
         RowType rowType = tableInfo.getRowType();
         sanityCheck(
                 rowType,

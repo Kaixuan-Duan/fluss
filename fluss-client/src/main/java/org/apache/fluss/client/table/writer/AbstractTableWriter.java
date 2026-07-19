@@ -40,8 +40,24 @@ public abstract class AbstractTableWriter implements TableWriter {
     protected final int fieldCount;
     private final @Nullable PartitionGetter partitionFieldGetter;
 
+    /**
+     * When set, all rows are routed to this fixed partition regardless of the value of their
+     * partition column(s). This is used by the INSERT OVERWRITE new-partition PoC where a new
+     * partition (registered under an internal logical name) is filled with data whose partition
+     * column keeps its original value.
+     */
+    private final @Nullable String fixedPartitionName;
+
     protected AbstractTableWriter(
             TablePath tablePath, TableInfo tableInfo, WriterClient writerClient) {
+        this(tablePath, tableInfo, writerClient, null);
+    }
+
+    protected AbstractTableWriter(
+            TablePath tablePath,
+            TableInfo tableInfo,
+            WriterClient writerClient,
+            @Nullable String fixedPartitionName) {
         this.tablePath = tablePath;
         this.writerClient = writerClient;
         this.fieldCount = tableInfo.getRowType().getFieldCount();
@@ -49,6 +65,7 @@ public abstract class AbstractTableWriter implements TableWriter {
                 tableInfo.isPartitioned()
                         ? new PartitionGetter(tableInfo.getRowType(), tableInfo.getPartitionKeys())
                         : null;
+        this.fixedPartitionName = fixedPartitionName;
     }
 
     /**
@@ -107,6 +124,11 @@ public abstract class AbstractTableWriter implements TableWriter {
     }
 
     protected PhysicalTablePath getPhysicalPath(InternalRow row) {
+        // fixed partition write: route every row to the given partition regardless of the row's
+        // own partition column value (used by the INSERT OVERWRITE new-partition PoC).
+        if (fixedPartitionName != null) {
+            return PhysicalTablePath.of(tablePath, fixedPartitionName);
+        }
         // not partitioned table, return the original physical path
         if (partitionFieldGetter == null) {
             return PhysicalTablePath.of(tablePath);

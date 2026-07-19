@@ -38,9 +38,10 @@ public class TableUpsert implements Upsert {
     private final WriterClient writerClient;
     private final @Nullable int[] targetColumns;
     private final MergeMode mergeMode;
+    private final @Nullable String fixedPartitionName;
 
     public TableUpsert(TablePath tablePath, TableInfo tableInfo, WriterClient writerClient) {
-        this(tablePath, tableInfo, writerClient, null, MergeMode.DEFAULT);
+        this(tablePath, tableInfo, writerClient, null, MergeMode.DEFAULT, null);
     }
 
     private TableUpsert(
@@ -48,12 +49,14 @@ public class TableUpsert implements Upsert {
             TableInfo tableInfo,
             WriterClient writerClient,
             @Nullable int[] targetColumns,
-            MergeMode mergeMode) {
+            MergeMode mergeMode,
+            @Nullable String fixedPartitionName) {
         this.tablePath = tablePath;
         this.tableInfo = tableInfo;
         this.writerClient = writerClient;
         this.targetColumns = targetColumns;
         this.mergeMode = mergeMode;
+        this.fixedPartitionName = fixedPartitionName;
     }
 
     @Override
@@ -74,7 +77,13 @@ public class TableUpsert implements Upsert {
                 }
             }
         }
-        return new TableUpsert(tablePath, tableInfo, writerClient, targetColumns, this.mergeMode);
+        return new TableUpsert(
+                tablePath,
+                tableInfo,
+                writerClient,
+                targetColumns,
+                this.mergeMode,
+                fixedPartitionName);
     }
 
     @Override
@@ -100,7 +109,19 @@ public class TableUpsert implements Upsert {
     @Override
     public Upsert mergeMode(MergeMode mode) {
         checkNotNull(mode, "merge mode");
-        return new TableUpsert(tablePath, tableInfo, writerClient, this.targetColumns, mode);
+        return new TableUpsert(
+                tablePath, tableInfo, writerClient, this.targetColumns, mode, fixedPartitionName);
+    }
+
+    @Override
+    public Upsert toPartition(String partitionName) {
+        return new TableUpsert(
+                tablePath,
+                tableInfo,
+                writerClient,
+                this.targetColumns,
+                this.mergeMode,
+                partitionName);
     }
 
     @Override
@@ -117,7 +138,8 @@ public class TableUpsert implements Upsert {
                                 mergeMode, tablePath));
             }
         }
-        return new UpsertWriterImpl(tablePath, tableInfo, targetColumns, writerClient, mergeMode);
+        return new UpsertWriterImpl(
+                tablePath, tableInfo, targetColumns, writerClient, mergeMode, fixedPartitionName);
     }
 
     @Override

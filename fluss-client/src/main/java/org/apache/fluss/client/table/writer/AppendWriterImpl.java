@@ -50,7 +50,15 @@ class AppendWriterImpl extends AbstractTableWriter implements AppendWriter {
     private final TableInfo tableInfo;
 
     AppendWriterImpl(TablePath tablePath, TableInfo tableInfo, WriterClient writerClient) {
-        super(tablePath, tableInfo, writerClient);
+        this(tablePath, tableInfo, writerClient, null);
+    }
+
+    AppendWriterImpl(
+            TablePath tablePath,
+            TableInfo tableInfo,
+            WriterClient writerClient,
+            @Nullable String fixedPartitionName) {
+        super(tablePath, tableInfo, writerClient, fixedPartitionName);
         List<String> bucketKeys = tableInfo.getBucketKeys();
         if (bucketKeys.isEmpty()) {
             this.bucketKeyEncoder = null;
