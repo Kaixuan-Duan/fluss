@@ -69,6 +69,17 @@ public abstract class FlinkSinkWriter<InputT> implements SinkWriter<InputT> {
      */
     protected final @Nullable String fixedPartitionName;
 
+    /**
+     * When set (together with {@link #fixedPartitionName}), the writer atomically swaps {@link
+     * #fixedPartitionName} (the internal shadow partition holding the new data) with this origin
+     * partition name once all input has been written ({@code flush(endOfInput=true)}). Used by the
+     * INSERT OVERWRITE new-partition PoC; requires the sink to run with parallelism 1.
+     */
+    protected final @Nullable String overwriteOriginPartitionName;
+
+    /** Guard to perform the overwrite swap exactly once. */
+    private transient boolean overwriteCompleted;
+
     private transient Connection connection;
     protected transient Table table;
     protected transient FlinkMetricRegistry flinkMetricRegistry;
@@ -120,6 +131,26 @@ public abstract class FlinkSinkWriter<InputT> implements SinkWriter<InputT> {
             MailboxExecutor mailboxExecutor,
             FlussSerializationSchema<InputT> serializationSchema,
             @Nullable String fixedPartitionName) {
+        this(
+                tablePath,
+                flussConfig,
+                tableRowType,
+                targetColumns,
+                mailboxExecutor,
+                serializationSchema,
+                fixedPartitionName,
+                null);
+    }
+
+    public FlinkSinkWriter(
+            TablePath tablePath,
+            Configuration flussConfig,
+            RowType tableRowType,
+            @Nullable int[] targetColumns,
+            MailboxExecutor mailboxExecutor,
+            FlussSerializationSchema<InputT> serializationSchema,
+            @Nullable String fixedPartitionName,
+            @Nullable String overwriteOriginPartitionName) {
         this.tablePath = tablePath;
         this.flussConfig = flussConfig;
         this.targetColumnIndexes = targetColumns;
@@ -127,6 +158,7 @@ public abstract class FlinkSinkWriter<InputT> implements SinkWriter<InputT> {
         this.mailboxExecutor = mailboxExecutor;
         this.serializationSchema = serializationSchema;
         this.fixedPartitionName = fixedPartitionName;
+        this.overwriteOriginPartitionName = overwriteOriginPartitionName;
     }
 
     public void initialize(SinkWriterMetricGroup metricGroup) {
@@ -198,6 +230,41 @@ public abstract class FlinkSinkWriter<InputT> implements SinkWriter<InputT> {
 
     @Override
     public abstract void flush(boolean endOfInput) throws IOException, InterruptedException;
+
+    /**
+     * INSERT OVERWRITE new-partition PoC: once all input has been written and flushed, atomically
+     * repoint the origin partition name to the internal shadow partition holding the new data via
+     * the swapPartition admin RPC. The old data stays under the internal name for deferred cleanup.
+     * Should be called by subclasses at the end of {@code flush(endOfInput)} after all pending
+     * writes are acknowledged.
+     */
+    protected void completeOverwriteIfNeeded(boolean endOfInput) throws IOException {
+        if (!endOfInput
+                || overwriteCompleted
+                || fixedPartitionName == null
+                || overwriteOriginPartitionName == null) {
+            return;
+        }
+        try {
+            connection
+                    .getAdmin()
+                    .swapPartition(tablePath, fixedPartitionName, overwriteOriginPartitionName)
+                    .get();
+            overwriteCompleted = true;
+            LOG.info(
+                    "Committed INSERT OVERWRITE for table {}: partition '{}' now points to the "
+                            + "data written into internal partition '{}'.",
+                    tablePath,
+                    overwriteOriginPartitionName,
+                    fixedPartitionName);
+        } catch (Exception e) {
+            throw new IOException(
+                    String.format(
+                            "Failed to swap overwrite partition '%s' with origin partition '%s' for table %s",
+                            fixedPartitionName, overwriteOriginPartitionName, tablePath),
+                    e);
+        }
+    }
 
     abstract CompletableFuture<?> writeRow(OperationType opType, InternalRow internalRow);
 

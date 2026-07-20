@@ -916,9 +916,9 @@ public class ZooKeeperClient implements AutoCloseable {
     }
 
     /** Get the partition and the id for the partitions of tables in ZK. */
-    public Map<TablePath, Map<String, Long>> getPartitionNameAndIdsForTables(
+    public Map<TablePath, Map<String, PartitionRegistration>> getPartitionRegistrationsForTables(
             List<TablePath> tablePaths) throws Exception {
-        Map<TablePath, Map<String, Long>> result = new HashMap<>();
+        Map<TablePath, Map<String, PartitionRegistration>> result = new HashMap<>();
 
         Map<TablePath, List<String>> tablePath2Partitions = getPartitionsForTables(tablePaths);
 
@@ -941,9 +941,9 @@ public class ZooKeeperClient implements AutoCloseable {
                 String zkPath = response.getPath();
                 TablePath tablePath = zkPath2TablePath.get(zkPath);
                 String partitionName = zkPath2PartitionName.get(zkPath);
-                long partitionId = PartitionZNode.decode(response.getData()).getPartitionId();
+                PartitionRegistration registration = PartitionZNode.decode(response.getData());
                 result.computeIfAbsent(tablePath, k -> new HashMap<>())
-                        .put(partitionName, partitionId);
+                        .put(partitionName, registration);
             } else {
                 LOG.warn(
                         "Failed to get data for path {}: {}",
@@ -1070,6 +1070,29 @@ public class ZooKeeperClient implements AutoCloseable {
             TablePath tablePath,
             long tableId)
             throws Exception {
+        registerPartitionAssignmentAndMetadata(
+                partitionId,
+                partitionName,
+                partitionAssignment,
+                remoteDataDir,
+                tablePath,
+                tableId,
+                null);
+    }
+
+    /**
+     * Register partition assignment and metadata in transaction, with an optional explicit physical
+     * partition name (see {@link PartitionRegistration#getPhysicalPartitionName()}).
+     */
+    public void registerPartitionAssignmentAndMetadata(
+            long partitionId,
+            String partitionName,
+            PartitionAssignment partitionAssignment,
+            String remoteDataDir,
+            TablePath tablePath,
+            long tableId,
+            @Nullable String physicalPartitionName)
+            throws Exception {
         // Merge "registerPartitionAssignment()" and "registerPartition()"
         // into one transaction. This is to avoid the case that the partition assignment is
         // registered
@@ -1114,10 +1137,47 @@ public class ZooKeeperClient implements AutoCloseable {
                                 metadataPath,
                                 PartitionZNode.encode(
                                         new PartitionRegistration(
-                                                tableId, partitionId, remoteDataDir)));
+                                                tableId,
+                                                partitionId,
+                                                remoteDataDir,
+                                                physicalPartitionName)));
 
         ops.add(tabletServerPartitionNode);
         ops.add(metadataPartitionNode);
+        zkClient.transaction().forOperations(ops);
+    }
+
+    /**
+     * Atomically swap the {@link PartitionRegistration} contents of two partition znodes of the
+     * same table in one ZK transaction, so each partition name points to the other partition id
+     * afterwards. Used by the INSERT OVERWRITE new-partition PoC.
+     *
+     * @param tablePath the table path
+     * @param partitionName1 the first partition name
+     * @param newRegistration1 the registration to write under {@code partitionName1}
+     * @param partitionName2 the second partition name
+     * @param newRegistration2 the registration to write under {@code partitionName2}
+     */
+    public void swapPartitionRegistrations(
+            TablePath tablePath,
+            String partitionName1,
+            PartitionRegistration newRegistration1,
+            String partitionName2,
+            PartitionRegistration newRegistration2)
+            throws Exception {
+        List<CuratorOp> ops = new ArrayList<>(2);
+        ops.add(
+                zkClient.transactionOp()
+                        .setData()
+                        .forPath(
+                                PartitionZNode.path(tablePath, partitionName1),
+                                PartitionZNode.encode(newRegistration1)));
+        ops.add(
+                zkClient.transactionOp()
+                        .setData()
+                        .forPath(
+                                PartitionZNode.path(tablePath, partitionName2),
+                                PartitionZNode.encode(newRegistration2)));
         zkClient.transaction().forOperations(ops);
     }
 

@@ -223,9 +223,18 @@ public class FlinkTableSink
         // Enable undo recovery for aggregation tables
         boolean enableUndoRecovery = mergeEngineType == MergeEngineType.AGGREGATION;
 
-        // INSERT OVERWRITE new-partition PoC: create an internal-name partition at compile time and
-        // route all rows to it. The rows keep their original partition column value.
-        String fixedPartitionName = overwrite ? createOverwritePartition() : null;
+        // INSERT OVERWRITE new-partition PoC: create an internal-name shadow partition at compile
+        // time and route all rows to it. The rows keep their original partition column value, and
+        // the shadow partition stores its data under the origin partition's physical name. After
+        // all input is written, the writer atomically swaps the origin name to the shadow
+        // partition (see FlinkSinkWriter#completeOverwriteIfNeeded).
+        String originPartitionName = null;
+        String fixedPartitionName = null;
+        if (overwrite) {
+            String[] overwritePartitions = createOverwritePartition();
+            originPartitionName = overwritePartitions[0];
+            fixedPartitionName = overwritePartitions[1];
+        }
 
         FlinkSink.SinkWriterBuilder<? extends FlinkSinkWriter, RowData> flinkSinkWriterBuilder =
                 (primaryKeyIndexes.length > 0)
@@ -242,7 +251,8 @@ public class FlinkTableSink
                                 new RowDataSerializationSchema(false, sinkIgnoreDelete),
                                 enableUndoRecovery,
                                 producerId,
-                                fixedPartitionName)
+                                fixedPartitionName,
+                                originPartitionName)
                         : new FlinkSink.AppendSinkWriterBuilder<>(
                                 tablePath,
                                 flussConfig,
@@ -253,18 +263,21 @@ public class FlinkTableSink
                                 lakeFormat,
                                 distributionMode,
                                 new RowDataSerializationSchema(true, sinkIgnoreDelete),
-                                fixedPartitionName);
+                                fixedPartitionName,
+                                originPartitionName);
 
-        return new FlinkSink<>(flinkSinkWriterBuilder, tablePath);
+        return new FlinkSink<>(flinkSinkWriterBuilder, tablePath, overwrite);
     }
 
     /**
-     * INSERT OVERWRITE new-partition PoC: create a partition under an internal logical name (used
-     * only as an addressing shell so the physical object can come online and accept writes), and
-     * return that internal name. The internal name is derived from the target partition value(s)
-     * plus a unique suffix, and stays within the partition-name char whitelist ([A-Za-z0-9_-]).
+     * INSERT OVERWRITE new-partition PoC: create a shadow partition under an internal logical name
+     * (used only as an addressing shell so the physical object can come online and accept writes)
+     * whose data directories use the origin partition's physical name, and return {@code [origin
+     * partition name, internal partition name]}. The internal name is derived from the target
+     * partition value(s) plus a unique suffix, and stays within the partition-name char whitelist
+     * ([A-Za-z0-9_-]). The origin partition must already exist (PoC limitation).
      */
-    private String createOverwritePartition() {
+    private String[] createOverwritePartition() {
         if (partitionKeys.isEmpty()) {
             throw new UnsupportedOperationException(
                     "INSERT OVERWRITE new-partition PoC only supports partitioned tables.");
@@ -277,6 +290,7 @@ public class FlinkTableSink
 
         // build the internal partition value for each partition key: <origin>_ow_<millis>
         long suffix = System.currentTimeMillis();
+        Map<String, String> originSpecMap = new LinkedHashMap<>();
         Map<String, String> internalSpecMap = new LinkedHashMap<>();
         for (String partitionKey : partitionKeys) {
             String originValue = staticPartitionSpec.get(partitionKey);
@@ -287,25 +301,50 @@ public class FlinkTableSink
                                         + "be specified. Missing value for partition key '%s'.",
                                 partitionKey));
             }
+            originSpecMap.put(partitionKey, originValue);
             internalSpecMap.put(partitionKey, originValue + "_ow_" + suffix);
         }
+        PartitionSpec originSpec = new PartitionSpec(originSpecMap);
         PartitionSpec internalSpec = new PartitionSpec(internalSpecMap);
 
         try (Connection connection = ConnectionFactory.createConnection(flussConfig)) {
             Admin admin = connection.getAdmin();
-            admin.createPartition(tablePath, internalSpec, false).get();
-            // reverse-look up the created partition to obtain its resolved name
-            for (PartitionInfo partitionInfo : admin.listPartitionInfos(tablePath).get()) {
-                if (partitionInfo.getPartitionSpec().equals(internalSpec)) {
-                    return partitionInfo.getPartitionName();
-                }
+            // resolve the origin partition name; the origin partition must already exist so the
+            // swap has a valid target (PoC limitation).
+            String originPartitionName = findPartitionName(admin, originSpec);
+            if (originPartitionName == null) {
+                throw new UnsupportedOperationException(
+                        String.format(
+                                "INSERT OVERWRITE new-partition PoC requires the target partition "
+                                        + "%s to exist for table %s.",
+                                originSpec, tablePath));
             }
-            throw new IllegalStateException(
-                    "Failed to find the created overwrite partition " + internalSpec);
+            // create the shadow partition under the internal logical name, storing data under
+            // the origin partition's physical name ({originName}-p{partitionId} directories).
+            admin.createPartition(tablePath, internalSpec, false, originPartitionName).get();
+            // reverse-look up the created partition to obtain its resolved name
+            String internalPartitionName = findPartitionName(admin, internalSpec);
+            if (internalPartitionName == null) {
+                throw new IllegalStateException(
+                        "Failed to find the created overwrite partition " + internalSpec);
+            }
+            return new String[] {originPartitionName, internalPartitionName};
+        } catch (UnsupportedOperationException e) {
+            throw e;
         } catch (Exception e) {
             throw new org.apache.fluss.exception.FlussRuntimeException(
                     "Failed to create overwrite partition " + internalSpec, e);
         }
+    }
+
+    private @Nullable String findPartitionName(Admin admin, PartitionSpec partitionSpec)
+            throws Exception {
+        for (PartitionInfo partitionInfo : admin.listPartitionInfos(tablePath).get()) {
+            if (partitionInfo.getPartitionSpec().equals(partitionSpec)) {
+                return partitionInfo.getPartitionName();
+            }
+        }
+        return null;
     }
 
     private List<String> columns(int[] columnIndexes) {

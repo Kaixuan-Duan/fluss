@@ -815,6 +815,24 @@ public class MetadataManager {
             PartitionAssignment partitionAssignment,
             ResolvedPartitionSpec partition,
             boolean ignoreIfExists) {
+        createPartition(
+                tablePath,
+                tableId,
+                remoteDataDir,
+                partitionAssignment,
+                partition,
+                ignoreIfExists,
+                null);
+    }
+
+    public void createPartition(
+            TablePath tablePath,
+            long tableId,
+            String remoteDataDir,
+            PartitionAssignment partitionAssignment,
+            ResolvedPartitionSpec partition,
+            boolean ignoreIfExists,
+            @Nullable String physicalPartitionName) {
         String partitionName = partition.getPartitionName();
         Optional<PartitionRegistration> optionalPartitionRegistration =
                 getOptionalPartitionRegistration(tablePath, partitionName);
@@ -863,7 +881,8 @@ public class MetadataManager {
                     partitionAssignment,
                     remoteDataDir,
                     tablePath,
-                    tableId);
+                    tableId,
+                    physicalPartitionName);
             LOG.info(
                     "Register partition {} to zookeeper for table [{}].", partitionName, tablePath);
         } catch (KeeperException.NodeExistsException nodeExistsException) {
@@ -905,6 +924,71 @@ public class MetadataManager {
                     "Fail to delete partition '{}' from zookeeper for table {}.",
                     partitionName,
                     tablePath,
+                    e);
+        }
+    }
+
+    /**
+     * Atomically swap the partition-name to partition-id mappings of two partitions of the same
+     * table (INSERT OVERWRITE new-partition PoC). After the swap, {@code toPartitionName} points to
+     * the partition id previously registered under {@code fromPartitionName} and vice versa. The
+     * old data is NOT deleted here: it stays under {@code fromPartitionName} for deferred cleanup
+     * via {@link #dropPartition}.
+     *
+     * @param tablePath the table path
+     * @param fromPartitionName the internal partition name holding the newly written data
+     * @param toPartitionName the origin partition name to be repointed to the new data
+     */
+    public void swapPartition(
+            TablePath tablePath, String fromPartitionName, String toPartitionName) {
+        PartitionRegistration fromRegistration =
+                getOptionalPartitionRegistration(tablePath, fromPartitionName)
+                        .orElseThrow(
+                                () ->
+                                        new PartitionNotExistException(
+                                                String.format(
+                                                        "Partition '%s' does not exist for table %s",
+                                                        fromPartitionName, tablePath)));
+        PartitionRegistration toRegistration =
+                getOptionalPartitionRegistration(tablePath, toPartitionName)
+                        .orElseThrow(
+                                () ->
+                                        new PartitionNotExistException(
+                                                String.format(
+                                                        "Partition '%s' does not exist for table %s",
+                                                        toPartitionName, tablePath)));
+
+        // materialize the default physical name (= the znode name at creation time) into an
+        // explicit value, otherwise rebuilding the coordinator context from ZK after the swap
+        // would wrongly derive the physical name from the new znode name.
+        if (fromRegistration.getPhysicalPartitionName() == null) {
+            fromRegistration = fromRegistration.newPhysicalPartitionName(fromPartitionName);
+        }
+        if (toRegistration.getPhysicalPartitionName() == null) {
+            toRegistration = toRegistration.newPhysicalPartitionName(toPartitionName);
+        }
+
+        try {
+            // each name now points to the other registration (partition id travels with its
+            // remote data dir and physical name).
+            zookeeperClient.swapPartitionRegistrations(
+                    tablePath,
+                    fromPartitionName,
+                    toRegistration,
+                    toPartitionName,
+                    fromRegistration);
+            LOG.info(
+                    "Swapped partition '{}' (partition id {}) with partition '{}' (partition id {}) for table {}.",
+                    fromPartitionName,
+                    fromRegistration.getPartitionId(),
+                    toPartitionName,
+                    toRegistration.getPartitionId(),
+                    tablePath);
+        } catch (Exception e) {
+            throw new FlussRuntimeException(
+                    String.format(
+                            "Fail to swap partition '%s' with partition '%s' for table %s.",
+                            fromPartitionName, toPartitionName, tablePath),
                     e);
         }
     }

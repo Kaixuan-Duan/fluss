@@ -87,6 +87,10 @@ public class CoordinatorContext {
     // a map from partition_id -> physicalTablePath
     private final Map<Long, PhysicalTablePath> pathByPartitionId = new HashMap<>();
     private final Map<PhysicalTablePath, Long> partitionIdByPath = new HashMap<>();
+    // a map from partition_id -> physical partition name used for data directories. Only contains
+    // partitions whose physical name differs from the logical partition name (INSERT OVERWRITE
+    // new-partition PoC). Fixed at partition creation time and never changed by partition swap.
+    private final Map<Long, String> physicalNameById = new HashMap<>();
 
     // a map from table_id to the table path
     private final Map<Long, TablePath> tablePathById = new HashMap<>();
@@ -391,6 +395,25 @@ public class CoordinatorContext {
     public void putPartition(long partitionId, PhysicalTablePath physicalTablePath) {
         this.pathByPartitionId.put(partitionId, physicalTablePath);
         this.partitionIdByPath.put(physicalTablePath, partitionId);
+    }
+
+    /**
+     * Record the explicit physical partition name of the partition. No-op when the given physical
+     * name is null (i.e. the physical name equals the logical partition name).
+     */
+    public void putPartitionPhysicalName(long partitionId, @Nullable String physicalPartitionName) {
+        if (physicalPartitionName != null) {
+            this.physicalNameById.put(partitionId, physicalPartitionName);
+        }
+    }
+
+    /**
+     * Get the physical partition name used for data directories of the partition, falling back to
+     * the logical partition name when no explicit physical name was recorded.
+     */
+    public @Nullable String getPhysicalPartitionName(long partitionId) {
+        String physicalName = physicalNameById.get(partitionId);
+        return physicalName != null ? physicalName : getPartitionName(partitionId);
     }
 
     public TableInfo getTableInfoById(long tableId) {
@@ -783,6 +806,7 @@ public class CoordinatorContext {
         if (physicalTablePath != null) {
             partitionIdByPath.remove(physicalTablePath);
         }
+        physicalNameById.remove(tablePartition.getPartitionId());
     }
 
     public void initSeverTags(Map<Integer, ServerTag> initialServerTags) {

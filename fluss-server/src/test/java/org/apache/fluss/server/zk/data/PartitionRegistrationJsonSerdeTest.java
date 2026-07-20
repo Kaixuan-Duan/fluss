@@ -36,10 +36,12 @@ class PartitionRegistrationJsonSerdeTest extends JsonSerdeTestBase<PartitionRegi
 
     @Override
     protected PartitionRegistration[] createObjects() {
-        PartitionRegistration[] partitionRegistrations = new PartitionRegistration[2];
+        PartitionRegistration[] partitionRegistrations = new PartitionRegistration[3];
 
         partitionRegistrations[0] = new PartitionRegistration(1234L, 5678L, "file://local/remote");
         partitionRegistrations[1] = new PartitionRegistration(246L, 135L, null);
+        partitionRegistrations[2] =
+                new PartitionRegistration(1234L, 5678L, "file://local/remote", "2030");
 
         return partitionRegistrations;
     }
@@ -48,7 +50,8 @@ class PartitionRegistrationJsonSerdeTest extends JsonSerdeTestBase<PartitionRegi
     protected String[] expectedJsons() {
         return new String[] {
             "{\"version\":1,\"table_id\":1234,\"partition_id\":5678,\"remote_data_dir\":\"file://local/remote\"}",
-            "{\"version\":1,\"table_id\":246,\"partition_id\":135}"
+            "{\"version\":1,\"table_id\":246,\"partition_id\":135}",
+            "{\"version\":1,\"table_id\":1234,\"partition_id\":5678,\"remote_data_dir\":\"file://local/remote\",\"physical_partition_name\":\"2030\"}"
         };
     }
 

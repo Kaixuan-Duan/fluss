@@ -93,6 +93,28 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
             FlussSerializationSchema<InputT> flussSerializationSchema,
             @Nullable ProducerOffsetReporter offsetReporter,
             @Nullable String fixedPartitionName) {
+        this(
+                tablePath,
+                flussConfig,
+                tableRowType,
+                targetColumnIndexes,
+                mailboxExecutor,
+                flussSerializationSchema,
+                offsetReporter,
+                fixedPartitionName,
+                null);
+    }
+
+    public UpsertSinkWriter(
+            TablePath tablePath,
+            Configuration flussConfig,
+            RowType tableRowType,
+            @Nullable int[] targetColumnIndexes,
+            MailboxExecutor mailboxExecutor,
+            FlussSerializationSchema<InputT> flussSerializationSchema,
+            @Nullable ProducerOffsetReporter offsetReporter,
+            @Nullable String fixedPartitionName,
+            @Nullable String overwriteOriginPartitionName) {
         super(
                 tablePath,
                 flussConfig,
@@ -100,7 +122,8 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
                 targetColumnIndexes,
                 mailboxExecutor,
                 flussSerializationSchema,
-                fixedPartitionName);
+                fixedPartitionName,
+                overwriteOriginPartitionName);
         this.offsetReporter = offsetReporter;
     }
 
@@ -155,6 +178,7 @@ public class UpsertSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
     public void flush(boolean endOfInput) throws IOException, InterruptedException {
         upsertWriter.flush();
         checkAsyncException();
+        completeOverwriteIfNeeded(endOfInput);
     }
 
     @Override

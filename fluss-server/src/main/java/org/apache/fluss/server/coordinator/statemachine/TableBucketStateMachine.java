@@ -205,8 +205,11 @@ public class TableBucketStateMachine {
                 BucketState currentState = coordinatorContext.getBucketState(tableBucket);
                 String partitionName = null;
                 if (tableBucket.getPartitionId() != null) {
+                    // use the physical partition name as the name is only used by tablet servers
+                    // to create data directories
                     partitionName =
-                            coordinatorContext.getPartitionName(tableBucket.getPartitionId());
+                            coordinatorContext.getPhysicalPartitionName(
+                                    tableBucket.getPartitionId());
                     if (partitionName == null) {
                         logFailedStateChange(
                                 tableBucket,
@@ -339,7 +342,10 @@ public class TableBucketStateMachine {
             BucketState currentState = coordinatorContext.getBucketState(tableBucket);
             String partitionName = null;
             if (tableBucket.getPartitionId() != null) {
-                partitionName = coordinatorContext.getPartitionName(tableBucket.getPartitionId());
+                // use the physical partition name as the name is only used by tablet servers to
+                // create data directories
+                partitionName =
+                        coordinatorContext.getPhysicalPartitionName(tableBucket.getPartitionId());
                 if (partitionName == null) {
                     logFailedStateChange(
                             tableBucket,

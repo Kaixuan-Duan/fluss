@@ -84,6 +84,7 @@ import org.apache.fluss.server.coordinator.event.NewTabletServerEvent;
 import org.apache.fluss.server.coordinator.event.NotifyKvSnapshotOffsetEvent;
 import org.apache.fluss.server.coordinator.event.NotifyLakeTableOffsetEvent;
 import org.apache.fluss.server.coordinator.event.NotifyLeaderAndIsrResponseReceivedEvent;
+import org.apache.fluss.server.coordinator.event.PartitionRegistrationChangeEvent;
 import org.apache.fluss.server.coordinator.event.RebalanceEvent;
 import org.apache.fluss.server.coordinator.event.RebalanceTaskTimeoutEvent;
 import org.apache.fluss.server.coordinator.event.RemoveServerTagEvent;
@@ -115,6 +116,7 @@ import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.BucketAssignment;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
+import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.RebalanceTask;
 import org.apache.fluss.server.zk.data.RemoteLogManifestHandle;
 import org.apache.fluss.server.zk.data.ServerTags;
@@ -451,8 +453,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
                         .filter(entry -> entry.getValue().isPartitioned())
                         .map(Map.Entry::getKey)
                         .collect(Collectors.toList());
-        Map<TablePath, Map<String, Long>> tablePathMap =
-                zooKeeperClient.getPartitionNameAndIdsForTables(partitionedTablePathList);
+        Map<TablePath, Map<String, PartitionRegistration>> tablePathMap =
+                zooKeeperClient.getPartitionRegistrationsForTables(partitionedTablePathList);
         for (TablePath tablePath : tablePathSet) {
             TableInfo tableInfo = tablePath2TableInfoMap.get(tablePath);
             coordinatorContext.putTablePath(tableInfo.getTableId(), tablePath);
@@ -463,13 +465,17 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 lakeTables.add(Tuple2.of(tableInfo, System.currentTimeMillis()));
             }
             if (tableInfo.isPartitioned()) {
-                Map<String, Long> partitions = tablePathMap.get(tablePath);
+                Map<String, PartitionRegistration> partitions = tablePathMap.get(tablePath);
                 if (partitions != null) {
-                    for (Map.Entry<String, Long> partition : partitions.entrySet()) {
+                    for (Map.Entry<String, PartitionRegistration> partition :
+                            partitions.entrySet()) {
                         // put partition info to coordinator context
+                        long partitionId = partition.getValue().getPartitionId();
                         coordinatorContext.putPartition(
-                                partition.getValue(),
+                                partitionId,
                                 PhysicalTablePath.of(tableInfo.getTablePath(), partition.getKey()));
+                        coordinatorContext.putPartitionPhysicalName(
+                                partitionId, partition.getValue().getPhysicalPartitionName());
                     }
                 }
                 // if the table is auto partition, put the partitions info
@@ -658,6 +664,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
             processSchemaChange(schemaChangeEvent);
         } else if (event instanceof TableRegistrationChangeEvent) {
             processTableRegistrationChange((TableRegistrationChangeEvent) event);
+        } else if (event instanceof PartitionRegistrationChangeEvent) {
+            processPartitionRegistrationChange((PartitionRegistrationChangeEvent) event);
         } else if (event instanceof NotifyLeaderAndIsrResponseReceivedEvent) {
             processNotifyLeaderAndIsrResponseReceivedEvent(
                     (NotifyLeaderAndIsrResponseReceivedEvent) event);
@@ -931,6 +939,46 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 null);
     }
 
+    private void processPartitionRegistrationChange(PartitionRegistrationChangeEvent event) {
+        long partitionId = event.getPartitionId();
+        PhysicalTablePath newPath =
+                PhysicalTablePath.of(event.getTablePath(), event.getPartitionName());
+
+        // Skip if the partition is unknown or the mapping is already up-to-date. Should not
+        // happen in normal cases as partition znode data only changes on partition swap.
+        if (!coordinatorContext.containsPartitionId(partitionId)) {
+            LOG.warn(
+                    "Partition id {} is not registered in coordinator context, "
+                            + "skip processing partition registration change for {}.",
+                    partitionId,
+                    newPath);
+            return;
+        }
+        if (newPath.equals(coordinatorContext.getPhysicalTablePath(partitionId).orElse(null))) {
+            return;
+        }
+
+        LOG.info(
+                "Partition name {} is repointed to partition id {} by partition swap.",
+                newPath,
+                partitionId);
+        // refresh the name <-> id mappings. Note: the physical name mapping (used for data
+        // directories) is intentionally NOT changed, it travels with the partition id.
+        coordinatorContext.putPartition(partitionId, newPath);
+
+        // push the new name -> id mapping to all tablet servers so that clients resolving the
+        // partition name won't get the stale partition id.
+        Set<TableBucket> tableBuckets = new HashSet<>();
+        coordinatorContext
+                .getAllBucketsForPartition(event.getTableId(), partitionId)
+                .forEach(tableBuckets::add);
+        updateTabletServerMetadataCache(
+                new HashSet<>(coordinatorContext.getLiveTabletServers().values()),
+                null,
+                null,
+                tableBuckets);
+    }
+
     private void postAlterTableProperties(TableInfo oldTableInfo, TableInfo newTableInfo) {
         boolean dataLakeEnabled = newTableInfo.getTableConfig().isDataLakeEnabled();
         boolean toEnableDataLake =
@@ -1009,6 +1057,10 @@ public class CoordinatorEventProcessor implements EventProcessor {
         TablePath tablePath = createPartitionEvent.getTablePath();
         String partitionName = createPartitionEvent.getPartitionName();
         PartitionAssignment partitionAssignment = createPartitionEvent.getPartitionAssignment();
+        // record the physical name BEFORE bringing buckets online: the physical name is used to
+        // build the PhysicalTablePath carried in NotifyLeaderAndIsr requests (data dir creation)
+        coordinatorContext.putPartitionPhysicalName(
+                partitionId, createPartitionEvent.getPhysicalPartitionName());
         tableManager.onCreateNewPartition(
                 tablePath,
                 tableId,

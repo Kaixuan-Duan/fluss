@@ -369,6 +369,28 @@ public interface Admin extends AutoCloseable {
             TablePath tablePath, PartitionSpec partitionSpec, boolean ignoreIfExists);
 
     /**
+     * Create a new partition for a partitioned table with an explicit physical partition name.
+     *
+     * <p>The physical partition name is only used to name the data directories ({@code
+     * {physicalName}-p{partitionId}}) on tablet servers and remote storage, while the logical
+     * partition name (derived from the partition spec) is still used for metadata addressing. This
+     * is used by the INSERT OVERWRITE new-partition PoC where a shadow partition is registered
+     * under an internal logical name but stores data under the origin partition's name.
+     *
+     * @param tablePath The table path of the table.
+     * @param partitionSpec The partition spec to add.
+     * @param ignoreIfExists Flag to specify behavior when a partition with the given name already
+     *     exists: if set to false, throw a PartitionAlreadyExistsException, if set to true, do
+     *     nothing.
+     * @param physicalPartitionName the physical partition name used for data directories.
+     */
+    CompletableFuture<Void> createPartition(
+            TablePath tablePath,
+            PartitionSpec partitionSpec,
+            boolean ignoreIfExists,
+            String physicalPartitionName);
+
+    /**
      * Drop a partition from a partitioned table.
      *
      * <p>The following exceptions can be anticipated when calling {@code get()} on returned future.
@@ -389,6 +411,29 @@ public interface Admin extends AutoCloseable {
      */
     CompletableFuture<Void> dropPartition(
             TablePath tablePath, PartitionSpec partitionSpec, boolean ignoreIfNotExists);
+
+    /**
+     * Atomically swap the partition-name to partition-id mappings of two partitions of the same
+     * table.
+     *
+     * <p>This is used by the INSERT OVERWRITE new-partition PoC: after the overwrite job finished
+     * writing into the internal shadow partition, the origin partition name is atomically repointed
+     * to the shadow partition's data, while the internal name keeps the old data for deferred
+     * cleanup (dropped later via {@link #dropPartition}).
+     *
+     * <p>The following exceptions can be anticipated when calling {@code get()} on returned future.
+     *
+     * <ul>
+     *   <li>{@link TableNotExistException} if the table does not exist.
+     *   <li>{@link PartitionNotExistException} if either partition does not exist.
+     * </ul>
+     *
+     * @param tablePath The table path of the table.
+     * @param fromPartitionName the internal partition name holding the newly written data.
+     * @param toPartitionName the origin partition name to be repointed to the new data.
+     */
+    CompletableFuture<Void> swapPartition(
+            TablePath tablePath, String fromPartitionName, String toPartitionName);
 
     /**
      * Get the latest kv snapshots of the given table asynchronously. A kv snapshot is a snapshot of

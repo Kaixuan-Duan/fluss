@@ -37,6 +37,7 @@ public class PartitionRegistrationJsonSerde
     private static final String TABLE_ID_KEY = "table_id";
     private static final String PARTITION_ID_KEY = "partition_id";
     private static final String REMOTE_DATA_DIR_KEY = "remote_data_dir";
+    private static final String PHYSICAL_PARTITION_NAME_KEY = "physical_partition_name";
     private static final int VERSION = 1;
 
     @Override
@@ -48,6 +49,10 @@ public class PartitionRegistrationJsonSerde
         generator.writeNumberField(PARTITION_ID_KEY, registration.getPartitionId());
         if (registration.getRemoteDataDir() != null) {
             generator.writeStringField(REMOTE_DATA_DIR_KEY, registration.getRemoteDataDir());
+        }
+        if (registration.getPhysicalPartitionName() != null) {
+            generator.writeStringField(
+                    PHYSICAL_PARTITION_NAME_KEY, registration.getPhysicalPartitionName());
         }
         generator.writeEndObject();
     }
@@ -62,6 +67,13 @@ public class PartitionRegistrationJsonSerde
         if (node.has(REMOTE_DATA_DIR_KEY)) {
             remoteDataDir = node.get(REMOTE_DATA_DIR_KEY).asText();
         }
-        return new PartitionRegistration(tableId, partitionId, remoteDataDir);
+        // The physical partition name is absent for partitions whose physical name equals the
+        // logical (znode) name, which is the common case.
+        String physicalPartitionName = null;
+        if (node.has(PHYSICAL_PARTITION_NAME_KEY)) {
+            physicalPartitionName = node.get(PHYSICAL_PARTITION_NAME_KEY).asText();
+        }
+        return new PartitionRegistration(
+                tableId, partitionId, remoteDataDir, physicalPartitionName);
     }
 }

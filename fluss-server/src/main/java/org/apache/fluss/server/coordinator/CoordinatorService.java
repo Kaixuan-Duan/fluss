@@ -133,6 +133,8 @@ import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseRequest;
 import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseResponse;
 import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
 import org.apache.fluss.rpc.messages.RemoveServerTagResponse;
+import org.apache.fluss.rpc.messages.SwapPartitionRequest;
+import org.apache.fluss.rpc.messages.SwapPartitionResponse;
 import org.apache.fluss.rpc.netty.server.Session;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.rpc.protocol.Errors;
@@ -752,7 +754,8 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 remoteDataDir,
                 partitionAssignment,
                 partitionToCreate,
-                request.isIgnoreIfNotExists());
+                request.isIgnoreIfNotExists(),
+                request.hasPhysicalPartitionName() ? request.getPhysicalPartitionName() : null);
         return CompletableFuture.completedFuture(response);
     }
 
@@ -775,6 +778,23 @@ public final class CoordinatorService extends RpcServiceBase implements Coordina
                 ResolvedPartitionSpec.fromPartitionSpec(table.partitionKeys, partitionSpec);
 
         metadataManager.dropPartition(tablePath, partitionToDrop, request.isIgnoreIfNotExists());
+        return CompletableFuture.completedFuture(response);
+    }
+
+    @Override
+    public CompletableFuture<SwapPartitionResponse> swapPartition(SwapPartitionRequest request) {
+        TablePath tablePath = toTablePath(request.getTablePath());
+        authorizeTable(OperationType.WRITE, tablePath);
+
+        SwapPartitionResponse response = new SwapPartitionResponse();
+        TableRegistration table = metadataManager.getTableRegistration(tablePath);
+        if (!table.isPartitioned()) {
+            throw new TableNotPartitionedException(
+                    "Only partitioned table support swap partition.");
+        }
+
+        metadataManager.swapPartition(
+                tablePath, request.getFromPartitionName(), request.getToPartitionName());
         return CompletableFuture.completedFuture(response);
     }
 

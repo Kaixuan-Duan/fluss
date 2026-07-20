@@ -65,6 +65,8 @@ import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseRequest;
 import org.apache.fluss.rpc.messages.ReleaseKvSnapshotLeaseResponse;
 import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
 import org.apache.fluss.rpc.messages.RemoveServerTagResponse;
+import org.apache.fluss.rpc.messages.SwapPartitionRequest;
+import org.apache.fluss.rpc.messages.SwapPartitionResponse;
 import org.apache.fluss.rpc.protocol.ApiKeys;
 import org.apache.fluss.rpc.protocol.RPC;
 
@@ -135,6 +137,16 @@ public interface AdminGateway extends AdminReadOnlyGateway {
      */
     @RPC(api = ApiKeys.DROP_PARTITION)
     CompletableFuture<DropPartitionResponse> dropPartition(DropPartitionRequest request);
+
+    /**
+     * Atomically swap the partition-name to partition-id mappings of two partitions of the same
+     * table. Used by the INSERT OVERWRITE new-partition PoC to repoint the origin partition name to
+     * the freshly written internal partition.
+     *
+     * @param request Swap partition request
+     */
+    @RPC(api = ApiKeys.SWAP_PARTITION)
+    CompletableFuture<SwapPartitionResponse> swapPartition(SwapPartitionRequest request);
 
     /**
      * create acls for a resource.

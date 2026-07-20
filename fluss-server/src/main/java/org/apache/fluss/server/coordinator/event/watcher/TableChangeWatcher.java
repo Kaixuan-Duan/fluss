@@ -27,6 +27,7 @@ import org.apache.fluss.server.coordinator.TableLifecycleThrottler;
 import org.apache.fluss.server.coordinator.event.CreatePartitionEvent;
 import org.apache.fluss.server.coordinator.event.CreateTableEvent;
 import org.apache.fluss.server.coordinator.event.EventManager;
+import org.apache.fluss.server.coordinator.event.PartitionRegistrationChangeEvent;
 import org.apache.fluss.server.coordinator.event.SchemaChangeEvent;
 import org.apache.fluss.server.coordinator.event.TableRegistrationChangeEvent;
 import org.apache.fluss.server.zk.ZooKeeperClient;
@@ -146,6 +147,25 @@ public class TableChangeWatcher {
                         // the table, then put the real table info to the path. so, it'll be a node
                         // changed event
                         if (newData != null) {
+                            // maybe the registration of a partition znode is changed, which
+                            // happens when a partition swap repoints the partition name to
+                            // another partition id (INSERT OVERWRITE new-partition PoC).
+                            PhysicalTablePath changedPartitionPath =
+                                    PartitionZNode.parsePath(newData.getPath());
+                            if (changedPartitionPath != null) {
+                                if (newData.getData() != null && newData.getData().length > 0) {
+                                    PartitionRegistration partition =
+                                            PartitionZNode.decode(newData.getData());
+                                    eventManager.put(
+                                            new PartitionRegistrationChangeEvent(
+                                                    changedPartitionPath.getTablePath(),
+                                                    partition.getTableId(),
+                                                    partition.getPartitionId(),
+                                                    changedPartitionPath.getPartitionName()));
+                                }
+                                break;
+                            }
+
                             TablePath tablePath = TableZNode.parsePath(newData.getPath());
                             if (tablePath == null) {
                                 break;
@@ -273,7 +293,12 @@ public class TableChangeWatcher {
             }
             eventManager.put(
                     new CreatePartitionEvent(
-                            tablePath, tableId, partitionId, partitionName, partitionAssignment));
+                            tablePath,
+                            tableId,
+                            partitionId,
+                            partitionName,
+                            partitionAssignment,
+                            partition.getPhysicalPartitionName()));
         }
 
         private void processTableRegistrationChange(TablePath tablePath, ChildData newData) {

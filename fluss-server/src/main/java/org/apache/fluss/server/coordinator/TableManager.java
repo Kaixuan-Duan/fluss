@@ -288,8 +288,11 @@ public class TableManager {
         // we can't delete the remote dir since we don't tablePath and partition name now
         TableInfo tableInfo = coordinatorContext.getTableInfoById(tablePartition.getTableId());
         if (tableInfo != null) {
+            // use the physical partition name to build the remote dir: the logical partition
+            // name may have been repointed to another partition id by a partition swap, while
+            // the physical name always matches the data directories of this partition id.
             String partitionName =
-                    coordinatorContext.getPartitionName(tablePartition.getPartitionId());
+                    coordinatorContext.getPhysicalPartitionName(tablePartition.getPartitionId());
             if (partitionName != null) {
                 remoteStorageCleaner.asyncDeletePartitionRemoteDir(
                         PhysicalTablePath.of(tableInfo.getTablePath(), partitionName),

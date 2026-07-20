@@ -502,7 +502,10 @@ public class ReplicaStateMachine {
     private String getPartitionName(TableBucket tableBucket) throws PartitionNotExistException {
         String partitionName;
         if (tableBucket.getPartitionId() != null) {
-            partitionName = coordinatorContext.getPartitionName(tableBucket.getPartitionId());
+            // use the physical partition name as the name is only used by tablet servers to
+            // create data directories (carried in NotifyLeaderAndIsr requests)
+            partitionName =
+                    coordinatorContext.getPhysicalPartitionName(tableBucket.getPartitionId());
             if (partitionName == null) {
                 throw new PartitionNotExistException(
                         String.format(

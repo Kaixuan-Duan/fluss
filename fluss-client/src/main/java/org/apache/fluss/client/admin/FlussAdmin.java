@@ -62,6 +62,7 @@ import org.apache.fluss.rpc.messages.AlterTableRequest;
 import org.apache.fluss.rpc.messages.CancelRebalanceRequest;
 import org.apache.fluss.rpc.messages.CreateAclsRequest;
 import org.apache.fluss.rpc.messages.CreateDatabaseRequest;
+import org.apache.fluss.rpc.messages.CreatePartitionRequest;
 import org.apache.fluss.rpc.messages.CreateTableRequest;
 import org.apache.fluss.rpc.messages.DatabaseExistsRequest;
 import org.apache.fluss.rpc.messages.DatabaseExistsResponse;
@@ -99,6 +100,7 @@ import org.apache.fluss.rpc.messages.PbTableStatsRespForBucket;
 import org.apache.fluss.rpc.messages.RebalanceRequest;
 import org.apache.fluss.rpc.messages.RebalanceResponse;
 import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
+import org.apache.fluss.rpc.messages.SwapPartitionRequest;
 import org.apache.fluss.rpc.messages.TableExistsRequest;
 import org.apache.fluss.rpc.messages.TableExistsResponse;
 import org.apache.fluss.rpc.protocol.ApiError;
@@ -435,11 +437,34 @@ public class FlussAdmin implements Admin {
     }
 
     @Override
+    public CompletableFuture<Void> createPartition(
+            TablePath tablePath,
+            PartitionSpec partitionSpec,
+            boolean ignoreIfExists,
+            String physicalPartitionName) {
+        CreatePartitionRequest request =
+                makeCreatePartitionRequest(tablePath, partitionSpec, ignoreIfExists);
+        request.setPhysicalPartitionName(physicalPartitionName);
+        return gateway.createPartition(request).thenApply(r -> null);
+    }
+
+    @Override
     public CompletableFuture<Void> dropPartition(
             TablePath tablePath, PartitionSpec partitionSpec, boolean ignoreIfNotExists) {
         return gateway.dropPartition(
                         makeDropPartitionRequest(tablePath, partitionSpec, ignoreIfNotExists))
                 .thenApply(r -> null);
+    }
+
+    @Override
+    public CompletableFuture<Void> swapPartition(
+            TablePath tablePath, String fromPartitionName, String toPartitionName) {
+        SwapPartitionRequest request = new SwapPartitionRequest();
+        request.setTablePath()
+                .setDatabaseName(tablePath.getDatabaseName())
+                .setTableName(tablePath.getTableName());
+        request.setFromPartitionName(fromPartitionName).setToPartitionName(toPartitionName);
+        return gateway.swapPartition(request).thenApply(r -> null);
     }
 
     @Override

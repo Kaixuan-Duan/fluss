@@ -541,6 +541,10 @@ message CreatePartitionRequest {
   required PbTablePath table_path = 1;
   required PbPartitionSpec partition_spec = 2;
   required bool ignore_if_not_exists = 3;
+  // INSERT OVERWRITE new-partition PoC: the physical partition name used to create
+  // data directories ({physicalName}-p{partitionId}); defaults to the logical
+  // partition name when absent.
+  optional string physical_partition_name = 4;
 }
 
 message CreatePartitionResponse {}
@@ -553,6 +557,21 @@ message DropPartitionRequest {
 }
 
 message DropPartitionResponse {}
+
+// swap partition request and response.
+// INSERT OVERWRITE new-partition PoC: atomically exchange the partition-name -> partition-id
+// mappings of two partitions of the same table, so the target (origin) partition name points
+// to the freshly written data while the source (internal) name keeps the old data for
+// deferred cleanup.
+message SwapPartitionRequest {
+  required PbTablePath table_path = 1;
+  // the internal partition name holding the newly written data
+  required string from_partition_name = 2;
+  // the origin partition name to be repointed to the new data
+  required string to_partition_name = 3;
+}
+
+message SwapPartitionResponse {}
 
 // commit remote log manifest request and response
 message CommitRemoteLogManifestRequest {

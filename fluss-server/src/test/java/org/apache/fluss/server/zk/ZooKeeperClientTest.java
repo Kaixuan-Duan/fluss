@@ -633,6 +633,52 @@ class ZooKeeperClientTest {
     }
 
     @Test
+    void testSwapPartitionRegistrations() throws Exception {
+        TablePath tablePath = TablePath.of("db", "swap_tb");
+        long tableId = 21;
+        PartitionAssignment partitionAssignment =
+                new PartitionAssignment(
+                        tableId,
+                        generateAssignment(
+                                        3,
+                                        3,
+                                        new TabletServerInfo[] {
+                                            new TabletServerInfo(0, "rack0"),
+                                            new TabletServerInfo(1, "rack1"),
+                                            new TabletServerInfo(2, "rack2")
+                                        })
+                                .getBucketAssignments());
+        // origin partition (id=1) and internal shadow partition (id=2) whose physical name is
+        // the origin partition name
+        zookeeperClient.registerPartitionAssignmentAndMetadata(
+                1L, "2030", partitionAssignment, remoteDataDir, tablePath, tableId);
+        zookeeperClient.registerPartitionAssignmentAndMetadata(
+                2L, "2030_ow_1", partitionAssignment, remoteDataDir, tablePath, tableId, "2030");
+
+        PartitionRegistration originReg = zookeeperClient.getPartition(tablePath, "2030").get();
+        PartitionRegistration internalReg =
+                zookeeperClient.getPartition(tablePath, "2030_ow_1").get();
+        assertThat(internalReg.getPhysicalPartitionName()).isEqualTo("2030");
+
+        // swap: origin name points to the internal registration and vice versa. Materialize the
+        // physical name of the origin registration like MetadataManager#swapPartition does.
+        zookeeperClient.swapPartitionRegistrations(
+                tablePath,
+                "2030_ow_1",
+                originReg.newPhysicalPartitionName("2030"),
+                "2030",
+                internalReg);
+
+        PartitionRegistration newOriginReg = zookeeperClient.getPartition(tablePath, "2030").get();
+        PartitionRegistration newInternalReg =
+                zookeeperClient.getPartition(tablePath, "2030_ow_1").get();
+        assertThat(newOriginReg.getPartitionId()).isEqualTo(2L);
+        assertThat(newOriginReg.getPhysicalPartitionName()).isEqualTo("2030");
+        assertThat(newInternalReg.getPartitionId()).isEqualTo(1L);
+        assertThat(newInternalReg.getPhysicalPartitionName()).isEqualTo("2030");
+    }
+
+    @Test
     void testServerTag() throws Exception {
         Map<Integer, ServerTag> serverTags = new HashMap<>();
         serverTags.put(0, ServerTag.PERMANENT_OFFLINE);

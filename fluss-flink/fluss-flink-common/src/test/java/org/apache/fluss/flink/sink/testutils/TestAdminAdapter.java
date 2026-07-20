@@ -186,8 +186,23 @@ public class TestAdminAdapter implements Admin {
     }
 
     @Override
+    public CompletableFuture<Void> createPartition(
+            TablePath tablePath,
+            PartitionSpec partitionSpec,
+            boolean ignoreIfExists,
+            String physicalPartitionName) {
+        throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
+    }
+
+    @Override
     public CompletableFuture<Void> dropPartition(
             TablePath tablePath, PartitionSpec partitionSpec, boolean ignoreIfNotExists) {
+        throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
+    }
+
+    @Override
+    public CompletableFuture<Void> swapPartition(
+            TablePath tablePath, String fromPartitionName, String toPartitionName) {
         throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
     }
 

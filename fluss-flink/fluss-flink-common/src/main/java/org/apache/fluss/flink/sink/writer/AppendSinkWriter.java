@@ -56,6 +56,24 @@ public class AppendSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
             MailboxExecutor mailboxExecutor,
             FlussSerializationSchema<InputT> serializationSchema,
             String fixedPartitionName) {
+        this(
+                tablePath,
+                flussConfig,
+                tableRowType,
+                mailboxExecutor,
+                serializationSchema,
+                fixedPartitionName,
+                null);
+    }
+
+    public AppendSinkWriter(
+            TablePath tablePath,
+            Configuration flussConfig,
+            RowType tableRowType,
+            MailboxExecutor mailboxExecutor,
+            FlussSerializationSchema<InputT> serializationSchema,
+            String fixedPartitionName,
+            String overwriteOriginPartitionName) {
         super(
                 tablePath,
                 flussConfig,
@@ -63,7 +81,8 @@ public class AppendSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
                 null,
                 mailboxExecutor,
                 serializationSchema,
-                fixedPartitionName);
+                fixedPartitionName,
+                overwriteOriginPartitionName);
     }
 
     @Override
@@ -88,6 +107,7 @@ public class AppendSinkWriter<InputT> extends FlinkSinkWriter<InputT> {
     public void flush(boolean endOfInput) throws IOException {
         appendWriter.flush();
         checkAsyncException();
+        completeOverwriteIfNeeded(endOfInput);
     }
 
     @Override

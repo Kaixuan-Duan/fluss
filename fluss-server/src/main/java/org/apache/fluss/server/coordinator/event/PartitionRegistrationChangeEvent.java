@@ -18,50 +18,28 @@
 package org.apache.fluss.server.coordinator.event;
 
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.server.zk.data.PartitionAssignment;
-
-import javax.annotation.Nullable;
 
 import java.util.Objects;
 
-/** An event for create a partition for a table. */
-public class CreatePartitionEvent implements CoordinatorEvent {
+/**
+ * An event for the registration data change of an existing partition znode, i.e. the partition name
+ * has been repointed to another partition id by a partition swap (INSERT OVERWRITE new-partition
+ * PoC). The coordinator refreshes its name to id mappings and pushes the new partition metadata to
+ * tablet servers on this event.
+ */
+public class PartitionRegistrationChangeEvent implements CoordinatorEvent {
 
     private final TablePath tablePath;
     private final long tableId;
-
     private final String partitionName;
     private final long partitionId;
-    private final PartitionAssignment partitionAssignment;
 
-    /**
-     * The physical partition name used to name the data directories; null when it equals the
-     * logical partition name (the common case).
-     */
-    private final @Nullable String physicalPartitionName;
-
-    public CreatePartitionEvent(
-            TablePath tablePath,
-            long tableId,
-            long partitionId,
-            String partitionName,
-            PartitionAssignment partitionAssignment) {
-        this(tablePath, tableId, partitionId, partitionName, partitionAssignment, null);
-    }
-
-    public CreatePartitionEvent(
-            TablePath tablePath,
-            long tableId,
-            long partitionId,
-            String partitionName,
-            PartitionAssignment partitionAssignment,
-            @Nullable String physicalPartitionName) {
+    public PartitionRegistrationChangeEvent(
+            TablePath tablePath, long tableId, long partitionId, String partitionName) {
         this.tablePath = tablePath;
         this.tableId = tableId;
         this.partitionId = partitionId;
         this.partitionName = partitionName;
-        this.partitionAssignment = partitionAssignment;
-        this.physicalPartitionName = physicalPartitionName;
     }
 
     public TablePath getTablePath() {
@@ -80,15 +58,6 @@ public class CreatePartitionEvent implements CoordinatorEvent {
         return partitionName;
     }
 
-    public PartitionAssignment getPartitionAssignment() {
-        return partitionAssignment;
-    }
-
-    @Nullable
-    public String getPhysicalPartitionName() {
-        return physicalPartitionName;
-    }
-
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -97,29 +66,21 @@ public class CreatePartitionEvent implements CoordinatorEvent {
         if (o == null || getClass() != o.getClass()) {
             return false;
         }
-        CreatePartitionEvent that = (CreatePartitionEvent) o;
+        PartitionRegistrationChangeEvent that = (PartitionRegistrationChangeEvent) o;
         return tableId == that.tableId
                 && partitionId == that.partitionId
                 && Objects.equals(tablePath, that.tablePath)
-                && Objects.equals(partitionName, that.partitionName)
-                && Objects.equals(partitionAssignment, that.partitionAssignment)
-                && Objects.equals(physicalPartitionName, that.physicalPartitionName);
+                && Objects.equals(partitionName, that.partitionName);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(
-                tablePath,
-                tableId,
-                partitionName,
-                partitionId,
-                partitionAssignment,
-                physicalPartitionName);
+        return Objects.hash(tablePath, tableId, partitionName, partitionId);
     }
 
     @Override
     public String toString() {
-        return "CreatePartitionEvent{"
+        return "PartitionRegistrationChangeEvent{"
                 + "tablePath="
                 + tablePath
                 + ", tableId="
@@ -129,11 +90,6 @@ public class CreatePartitionEvent implements CoordinatorEvent {
                 + '\''
                 + ", partitionId="
                 + partitionId
-                + ", partitionAssignment="
-                + partitionAssignment
-                + ", physicalPartitionName='"
-                + physicalPartitionName
-                + '\''
                 + '}';
     }
 }

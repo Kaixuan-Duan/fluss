@@ -27,9 +27,11 @@ import org.apache.fluss.client.table.scanner.log.ScanRecords;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.sink.shuffle.DistributionMode;
 import org.apache.fluss.metadata.PartitionInfo;
+import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
+import org.apache.fluss.server.replica.Replica;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
 import org.apache.fluss.utils.types.Tuple2;
 
@@ -76,6 +78,7 @@ import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.as
 import static org.apache.fluss.flink.source.testutils.FlinkRowAssertionsUtils.collectRowsWithTimeout;
 import static org.apache.fluss.flink.utils.FlinkTestBase.waitUntilPartitions;
 import static org.apache.fluss.server.testutils.FlussClusterExtension.BUILTIN_DATABASE;
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -832,12 +835,15 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
     }
 
     /**
-     * INSERT OVERWRITE new-partition PoC verification. Writes into an existing partition using
-     * INSERT OVERWRITE; the PoC routes the write into a fresh internal-name partition ({@code
-     * <origin>_ow_<millis>}) while each row keeps its original partition-column value. Verifies:
-     * (a) a new internal-name partition is created holding the written rows, (b) the partition
-     * column value in that new partition is the ORIGINAL value (not the internal name), and (c) the
-     * original partition's physical data is untouched.
+     * INSERT OVERWRITE new-partition PoC verification (append path). The overwrite writes into a
+     * shadow internal-name partition ({@code <origin>_ow_<millis>}) whose data directories use the
+     * origin partition's physical name, then atomically swaps the origin partition name to the
+     * shadow partition when the job finishes. Verifies: (a) after the job the origin name points to
+     * a NEW partition id holding the overwritten rows with the ORIGINAL partition-column value, (b)
+     * the old data stays readable under the old partition id (deferred deletion, existing consumers
+     * unaffected), (c) the shadow partition's data directories use the origin physical name, and
+     * (d) after dropping the internal partition, an end-to-end SQL batch read only sees the
+     * overwritten data.
      */
     @Test
     void testInsertOverwriteIntoNewPartition() throws Exception {
@@ -880,44 +886,72 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
         assertThat(originRowsBeforeOw)
                 .containsExactlyInAnyOrder("+I[1, 1001, 2030]", "+I[2, 1002, 2030]");
 
-        // INSERT OVERWRITE into the origin partition; PoC routes it into a new internal-name
-        // partition, keeping the rows' partition column value = originPartition. Using VALUES with
-        // a static partition (rather than SELECT from the same table) keeps this a bounded job.
+        // INSERT OVERWRITE into the origin partition with DIFFERENT rows; the write goes into a
+        // shadow internal-name partition and the origin name is atomically swapped to it at end
+        // of the job. Using VALUES with a static partition keeps this a bounded job.
         tEnv.executeSql(
                         String.format(
-                                "INSERT OVERWRITE %s PARTITION (c = '%s') VALUES (1, 1001), (2, 1002)",
+                                "INSERT OVERWRITE %s PARTITION (c = '%s') VALUES (11, 1101), (22, 1102)",
                                 tableName, originPartition))
                 .await();
 
         try (Connection conn = ConnectionFactory.createConnection(clientConf)) {
             Admin admin = conn.getAdmin();
+            long tableId = admin.getTableInfo(tablePath).get().getTableId();
             List<PartitionInfo> partitions = admin.listPartitionInfos(tablePath).get();
 
-            // a new internal-name partition <origin>_ow_<millis> should exist
-            PartitionInfo internalPartition =
-                    partitions.stream()
-                            .filter(p -> p.getPartitionName().startsWith(originPartition + "_ow_"))
-                            .findFirst()
-                            .orElseThrow(
-                                    () ->
-                                            new AssertionError(
-                                                    "No internal overwrite partition found, got: "
-                                                            + partitions.stream()
-                                                                    .map(
-                                                                            PartitionInfo
-                                                                                    ::getPartitionName)
-                                                                    .collect(Collectors.toList())));
-
-            // (a)+(b) the new partition holds the written rows with ORIGINAL partition value
-            List<String> newPartitionRows =
-                    readPartitionRows(conn, tablePath, internalPartition.getPartitionId(), 2);
+            // (a) the origin name now points to a NEW partition id holding the overwritten rows
+            // with the ORIGINAL partition-column value
+            long newPartitionId = findPartitionId(admin, tablePath, originPartition);
+            assertThat(newPartitionId).isNotEqualTo(originPartitionId);
+            List<String> newPartitionRows = readPartitionRows(conn, tablePath, newPartitionId, 2);
             assertThat(newPartitionRows)
-                    .containsExactlyInAnyOrder("+I[1, 1001, 2030]", "+I[2, 1002, 2030]");
+                    .containsExactlyInAnyOrder("+I[11, 1101, 2030]", "+I[22, 1102, 2030]");
 
-            // (c) the origin partition's physical data is untouched
+            // the internal-name partition still exists and points to the OLD partition id
+            PartitionInfo internalPartition =
+                    findInternalOverwritePartition(partitions, originPartition);
+            assertThat(internalPartition.getPartitionId()).isEqualTo(originPartitionId);
+
+            // (b) the old data stays readable under the old partition id (deferred deletion,
+            // simulating a consumer that subscribed before the swap)
             List<String> originRowsAfterOw =
                     readPartitionRows(conn, tablePath, originPartitionId, 2);
             assertThat(originRowsAfterOw).containsExactlyInAnyOrderElementsOf(originRowsBeforeOw);
+
+            // (c) the shadow partition stores its data under the origin physical name, i.e. the
+            // data directories are {origin}-p{newPartitionId} instead of the internal name
+            Replica newPartitionReplica =
+                    FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(
+                            new TableBucket(tableId, newPartitionId, 0));
+            assertThat(newPartitionReplica.getPhysicalTablePath().getPartitionName())
+                    .isEqualTo(originPartition);
+
+            // (d) deferred cleanup: drop the internal partition, the OLD partition id data is
+            // cleaned through the existing drop-partition path
+            admin.dropPartition(
+                            tablePath,
+                            new PartitionSpec(
+                                    Collections.singletonMap(
+                                            "c", internalPartition.getPartitionName())),
+                            false)
+                    .get();
+            waitUntil(
+                    () -> admin.listPartitionInfos(tablePath).get().size() == 1,
+                    Duration.ofMinutes(1),
+                    "internal overwrite partition is not cleaned up");
+        }
+
+        // end-to-end: a SQL read of the origin partition only sees the overwritten data (batch
+        // read is not supported for log tables, so use a streaming read from earliest)
+        try (CloseableIterator<Row> iterator =
+                tEnv.executeSql(
+                                String.format(
+                                        "SELECT * FROM %s WHERE c = '%s'",
+                                        tableName, originPartition))
+                        .collect()) {
+            assertResultsIgnoreOrder(
+                    iterator, Arrays.asList("+I[11, 1101, 2030]", "+I[22, 1102, 2030]"), true);
         }
     }
 
@@ -925,9 +959,10 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
      * INSERT OVERWRITE new-partition PoC verification for a PRIMARY KEY (upsert) partitioned table.
      * Mirrors {@link #testInsertOverwriteIntoNewPartition} but exercises the upsert write path
      * ({@code Upsert.toPartition}) instead of the append path. The primary key must include the
-     * partition key, so the PK is (a, c). Verifies the new internal-name partition holds the
-     * upserted rows with the ORIGINAL partition-column value, and the origin partition is
-     * untouched.
+     * partition key, so the PK is (a, c). Verifies the swap semantics: after the job the origin
+     * name points to a NEW partition id holding the upserted rows with the ORIGINAL
+     * partition-column value, while the old data stays under the old id until the internal
+     * partition is dropped.
      */
     @Test
     void testInsertOverwriteIntoNewPartitionForPkTable() throws Exception {
@@ -971,43 +1006,56 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
         assertThat(originRowsBeforeOw)
                 .containsExactlyInAnyOrder("+I[1, 1001, 2030]", "+I[2, 1002, 2030]");
 
-        // INSERT OVERWRITE into the origin partition; PoC routes it into a new internal-name
-        // partition through the upsert write path, keeping the rows' partition column value.
+        // INSERT OVERWRITE into the origin partition with DIFFERENT rows through the upsert write
+        // path; the origin name is atomically swapped to the shadow partition at end of the job.
         tEnv.executeSql(
                         String.format(
-                                "INSERT OVERWRITE %s PARTITION (c = '%s') VALUES (1, 1001), (2, 1002)",
+                                "INSERT OVERWRITE %s PARTITION (c = '%s') VALUES (1, 2001), (2, 2002)",
                                 tableName, originPartition))
                 .await();
 
         try (Connection conn = ConnectionFactory.createConnection(clientConf)) {
             Admin admin = conn.getAdmin();
+            long tableId = admin.getTableInfo(tablePath).get().getTableId();
             List<PartitionInfo> partitions = admin.listPartitionInfos(tablePath).get();
 
-            // a new internal-name partition <origin>_ow_<millis> should exist
-            PartitionInfo internalPartition =
-                    partitions.stream()
-                            .filter(p -> p.getPartitionName().startsWith(originPartition + "_ow_"))
-                            .findFirst()
-                            .orElseThrow(
-                                    () ->
-                                            new AssertionError(
-                                                    "No internal overwrite partition found, got: "
-                                                            + partitions.stream()
-                                                                    .map(
-                                                                            PartitionInfo
-                                                                                    ::getPartitionName)
-                                                                    .collect(Collectors.toList())));
-
-            // the new partition holds the upserted rows with ORIGINAL partition value
-            List<String> newPartitionRows =
-                    readPartitionRows(conn, tablePath, internalPartition.getPartitionId(), 2);
+            // the origin name now points to a NEW partition id holding the upserted rows with
+            // the ORIGINAL partition-column value
+            long newPartitionId = findPartitionId(admin, tablePath, originPartition);
+            assertThat(newPartitionId).isNotEqualTo(originPartitionId);
+            List<String> newPartitionRows = readPartitionRows(conn, tablePath, newPartitionId, 2);
             assertThat(newPartitionRows)
-                    .containsExactlyInAnyOrder("+I[1, 1001, 2030]", "+I[2, 1002, 2030]");
+                    .containsExactlyInAnyOrder("+I[1, 2001, 2030]", "+I[2, 2002, 2030]");
 
-            // the origin partition's physical data is untouched
+            // the internal-name partition still exists and points to the OLD partition id
+            PartitionInfo internalPartition =
+                    findInternalOverwritePartition(partitions, originPartition);
+            assertThat(internalPartition.getPartitionId()).isEqualTo(originPartitionId);
+
+            // the old data stays readable under the old partition id (deferred deletion)
             List<String> originRowsAfterOw =
                     readPartitionRows(conn, tablePath, originPartitionId, 2);
             assertThat(originRowsAfterOw).containsExactlyInAnyOrderElementsOf(originRowsBeforeOw);
+
+            // the shadow partition stores its data under the origin physical name
+            Replica newPartitionReplica =
+                    FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(
+                            new TableBucket(tableId, newPartitionId, 0));
+            assertThat(newPartitionReplica.getPhysicalTablePath().getPartitionName())
+                    .isEqualTo(originPartition);
+
+            // deferred cleanup of the old data through the existing drop-partition path
+            admin.dropPartition(
+                            tablePath,
+                            new PartitionSpec(
+                                    Collections.singletonMap(
+                                            "c", internalPartition.getPartitionName())),
+                            false)
+                    .get();
+            waitUntil(
+                    () -> admin.listPartitionInfos(tablePath).get().size() == 1,
+                    Duration.ofMinutes(1),
+                    "internal overwrite partition is not cleaned up");
         }
     }
 
@@ -1019,6 +1067,21 @@ abstract class FlinkTableSinkITCase extends AbstractTestBase {
             }
         }
         throw new IllegalStateException("Partition not found: " + partitionName);
+    }
+
+    /** Find the internal overwrite partition ({@code <origin>_ow_<millis>}) or fail. */
+    private static PartitionInfo findInternalOverwritePartition(
+            List<PartitionInfo> partitions, String originPartition) {
+        return partitions.stream()
+                .filter(p -> p.getPartitionName().startsWith(originPartition + "_ow_"))
+                .findFirst()
+                .orElseThrow(
+                        () ->
+                                new AssertionError(
+                                        "No internal overwrite partition found, got: "
+                                                + partitions.stream()
+                                                        .map(PartitionInfo::getPartitionName)
+                                                        .collect(Collectors.toList())));
     }
 
     /** Read all rows of a single partition (bucket 0) via the Fluss log scanner. */
