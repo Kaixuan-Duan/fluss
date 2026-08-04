@@ -482,6 +482,107 @@ final class LogTabletTest extends LogTestBase {
                                 logTablet.getTableBucket().getBucket()));
     }
 
+    // --------------------------------------------------------------------------------------------
+    // TTL-based pre-roll tests
+    // --------------------------------------------------------------------------------------------
+
+    /**
+     * Tests that deleteExpiredSegments completes successfully when the active segment has exceeded
+     * TTL and the segment is safely backed up remotely. With a single segment the single-segment
+     * guard prevents pre-roll, but the call must still succeed without errors.
+     */
+    @Test
+    void testDeleteExpiredSegmentsSucceedsWhenExpiredAndBackedUp() throws Exception {
+        // Short TTL so segment expires quickly
+        conf.set(ConfigOptions.TABLE_LOG_TTL, Duration.ofMillis(100));
+        Configuration testConf = new Configuration(conf);
+        logTablet = createLogTablet(testConf);
+
+        MemoryLogRecords records =
+                genMemoryLogRecordsByObject(
+                        Arrays.asList(new Object[] {1, "a"}, new Object[] {2, "b"}));
+        logTablet.appendAsLeader(records);
+
+        // Advance time past TTL
+        java.util.concurrent.TimeUnit.MILLISECONDS.sleep(200);
+
+        // Signal that the data is safely backed up
+        logTablet.updateRemoteLogEndOffset(2L);
+
+        int segmentCountBefore = logTablet.logSegments(0, Long.MAX_VALUE).size();
+        assertThat(segmentCountBefore).isEqualTo(1);
+
+        // deleteExpiredSegments should complete without error
+        // Single-segment guard prevents pre-roll, so count stays unchanged
+        logTablet.deleteExpiredSegments();
+
+        assertThat(logTablet.logSegments(0, Long.MAX_VALUE).size()).isEqualTo(segmentCountBefore);
+    }
+
+    @Test
+    void testNoPreRollForSingleSegmentEvenIfExpiredAndBackedUp() throws Exception {
+        // Confirms: with only 1 segment the single-segment guard skips pre-roll
+        // regardless of TTL expiry and remote backup status.
+        conf.set(ConfigOptions.TABLE_LOG_TTL, Duration.ofMillis(100));
+        Configuration testConf = new Configuration(conf);
+        logTablet = createLogTablet(testConf);
+
+        MemoryLogRecords records =
+                genMemoryLogRecordsByObject(
+                        Arrays.asList(new Object[] {1, "a"}, new Object[] {2, "b"}));
+        logTablet.appendAsLeader(records);
+
+        java.util.concurrent.TimeUnit.MILLISECONDS.sleep(200);
+        logTablet.updateRemoteLogEndOffset(2L);
+
+        int segmentCountBefore = logTablet.logSegments(0, Long.MAX_VALUE).size();
+
+        logTablet.deleteExpiredSegments();
+
+        assertThat(logTablet.logSegments(0, Long.MAX_VALUE).size()).isEqualTo(segmentCountBefore);
+    }
+
+    @Test
+    void testNoPreRollWhenNotYetExpired() throws Exception {
+        // With long TTL the segment won't expire, so even without any remote backup signal
+        // the pre-roll path is skipped.
+        conf.set(ConfigOptions.TABLE_LOG_TTL, Duration.ofHours(1));
+        Configuration testConf = new Configuration(conf);
+        logTablet = createLogTablet(testConf);
+
+        MemoryLogRecords records =
+                genMemoryLogRecordsByObject(
+                        Arrays.asList(new Object[] {1, "a"}, new Object[] {2, "b"}));
+        logTablet.appendAsLeader(records);
+
+        int segmentCountBefore = logTablet.logSegments(0, Long.MAX_VALUE).size();
+
+        logTablet.deleteExpiredSegments();
+
+        assertThat(logTablet.logSegments(0, Long.MAX_VALUE).size()).isEqualTo(segmentCountBefore);
+    }
+
+    @Test
+    void testNoPreRollWhenNotRemotelyBackedUp() throws Exception {
+        // Segment expired by TTL but no remote-backup channel satisfied → skip pre-roll.
+        conf.set(ConfigOptions.TABLE_LOG_TTL, Duration.ofMillis(100));
+        Configuration testConf = new Configuration(conf);
+        logTablet = createLogTablet(testConf);
+
+        MemoryLogRecords records =
+                genMemoryLogRecordsByObject(
+                        Arrays.asList(new Object[] {1, "a"}, new Object[] {2, "b"}));
+        logTablet.appendAsLeader(records);
+
+        java.util.concurrent.TimeUnit.MILLISECONDS.sleep(200);
+
+        // Deliberately omitting updateRemoteLogEndOffset / updateHighWatermark update.
+        int segmentCountBefore = logTablet.logSegments(0, Long.MAX_VALUE).size();
+        logTablet.deleteExpiredSegments();
+
+        assertThat(logTablet.logSegments(0, Long.MAX_VALUE).size()).isEqualTo(segmentCountBefore);
+    }
+
     private LogTablet createLogTablet(Configuration config) throws Exception {
         File logDir =
                 LogTestUtils.makeRandomLogTabletDir(

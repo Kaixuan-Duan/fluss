@@ -728,6 +728,101 @@ public final class LogTablet {
                 Math.max(estimatedPendingStartTimeMs, candidatePendingStartTimeMs);
     }
 
+    /**
+     * Check if the active segment has expired based on TTL and remote backup status, and if so,
+     * roll it before the caller proceeds with deleting expired segments. This allows the previously
+     * active segment to be treated as an inactive segment for normal TTL-based cleanup.
+     */
+    private void maybeRollActiveIfExpired(List<LogSegment> allSegments, long now)
+            throws IOException {
+        // Single-segment guard: skip roll if there's only one segment, because rolling would leave
+        // us with an empty active segment that cannot be cleaned up by the deletion logic
+        if (allSegments.size() <= 1) {
+            return;
+        }
+
+        LogSegment activeSegment = localLog.getSegments().activeSegment();
+
+        // Condition A: check if the active segment has exceeded its TTL
+        boolean expired = !isSegmentExpired(now, activeSegment, logTtlMs);
+        if (expired) {
+            return;
+        }
+
+        // Condition B: check if the active segment is safely backed up remotely
+        boolean remoteBackedUp = isRemoteBackupComplete(activeSegment);
+        if (!remoteBackedUp) {
+            return;
+        }
+
+        // Both conditions met: perform pre-roll to allow the old active segment
+        // to be caught by the subsequent deletableExpiredSegments() cleanup.
+        LOG.info(
+                "Active segment {} for table bucket {} exceeds TTL and is remotely backed up, "
+                        + "rolling before expiration cleanup",
+                activeSegment.getBaseOffset(),
+                getTableBucket());
+        doRollUnprotected();
+    }
+
+    /**
+     * Check whether the given segment has been safely replicated to remote storage via any of the
+     * configured channels. Three independent channels are checked with OR logic — any single channel
+     * reaching the segment's end offset is sufficient:
+     *
+     * <ul>
+     *   <li>{@code highWatermark >= segment.endOffset()}
+     *   <li>{@code remoteLogEndOffset >= segment.endOffset()}
+     *   <li>(Lakehouse mode) {@code lakeLogEndOffset >= segment.endOffset()}, with null defense for
+     *       uninitialized lake house state
+     * </ul>
+     */
+    private boolean isRemoteBackupComplete(LogSegment segment) throws IOException {
+        long segmentEndOffset = segment.readNextOffset();
+
+        // Channel 1: high watermark covers the segment
+        if (highWatermarkMetadata.getMessageOffset() >= segmentEndOffset) {
+            return true;
+        }
+
+        // Channel 2: remote tiering covered the segment
+        if (remoteLogEndOffset >= segmentEndOffset) {
+            return true;
+        }
+
+        // Channel 3: Lakehouse sink covered the segment (null-safe)
+        if (isDataLakeEnabled) {
+            Long lakeEndObj = getLakeLogEndOffset();
+            if (lakeEndObj != null && lakeEndObj >= segmentEndOffset) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Perform the core log segment roll operation without acquiring any locks. This method must
+     * only be called from within a context that already holds {@code this.lock} (e.g., the outer
+     * synchronized block in {@link #deleteOldSegments}), relying on the enclosing synchronized
+     * block for memory visibility and atomicity.
+     */
+    @VisibleForTesting
+    void doRollUnprotected() throws IOException {
+        LogSegment newSegment = localLog.roll(Optional.empty());
+
+        // Take a snapshot of the writer state to facilitate recovery
+        writerStateManager.updateMapEndOffset(newSegment.getBaseOffset());
+        writerStateManager.takeSnapshot();
+        updateHighWatermarkWithLogEndOffset();
+
+        scheduler.scheduleOnce(
+                "flush-log",
+                () -> {
+                    flushUptoOffsetExclusive(newSegment.getBaseOffset());
+                });
+    }
+
     public void loadWriterSnapshot(long lastOffset) throws IOException {
         synchronized (lock) {
             rebuildWriterState(lastOffset, writerStateManager);
@@ -1321,6 +1416,21 @@ public final class LogTablet {
             DeletableSegmentsFinder deletableSegmentsFinder)
             throws IOException {
         synchronized (lock) {
+            // Pre-roll check: if the active segment has expired and is safely backed up remotely,
+            // roll it first so it becomes an inactive segment eligible for deletion by the
+            // deletableExpiredSegments() finder. This fixes the bug where the loop boundary
+            // i < segments.size()-1 would skip over the active segment.
+            try {
+                maybeRollActiveIfExpired(localLog.getSegments().values(), clock.milliseconds());
+            } catch (IOException e) {
+                throw new LogStorageException(
+                        String.format(
+                                "Failed to pre-roll active segment during expiration cleanup "
+                                        + "for table bucket %s.",
+                                getTableBucket()),
+                        e);
+            }
+
             List<LogSegment> deletableSegments = deletableSegmentsFinder.find(endOffset);
             if (!deletableSegments.isEmpty()) {
                 deleteSegments(deletableSegments, reason);
