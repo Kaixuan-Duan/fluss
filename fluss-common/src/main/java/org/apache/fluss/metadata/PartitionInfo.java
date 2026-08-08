@@ -91,8 +91,8 @@ public class PartitionInfo {
     /**
      * Resolves the effective bucket count for a (possibly absent) partition: returns the
      * partition's bucket count when {@code partitionInfo} is non-null, otherwise the table-level
-     * bucket count. The null case represents a non-partitioned table or a partition that was not
-     * looked up.
+     * bucket count. The null case represents a non-partitioned table or a partition whose
+     * PartitionInfo is not available.
      */
     public static int bucketCountOrDefault(
             @Nullable PartitionInfo partitionInfo, int tableBucketCount) {

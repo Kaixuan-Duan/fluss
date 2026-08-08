@@ -256,9 +256,9 @@ public class AutoPartitionManager implements AutoCloseable {
                                     partitionsByTable.get(tableId),
                                     "Auto partition state does not exist for table " + tableId);
                     if (!currentPartitions.containsKey(HISTORICAL_PARTITION_VALUE)) {
-                        // Same contract as createPartitions: hold the per-table read lock and read
-                        // the table-level bucket count fresh from ZK so the new partition records
-                        // the count a concurrent ALTER bucket.num cannot invalidate.
+                        // Hold the per-table read lock and read the table-level bucket count fresh
+                        // from ZK so the new partition records the count a concurrent ALTER
+                        // bucket.num cannot invalidate.
                         TablePath tablePath = tableInfo.getTablePath();
                         Lock readLock = metadataManager.getBucketRescaleLock(tablePath).readLock();
                         readLock.lock();

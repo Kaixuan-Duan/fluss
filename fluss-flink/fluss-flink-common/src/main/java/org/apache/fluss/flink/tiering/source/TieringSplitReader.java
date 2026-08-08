@@ -341,8 +341,7 @@ public class TieringSplitReader<WriteResult>
                     tablePath,
                     split.getTableBucket().getTableId());
             // Snapshot each partition's actual bucket count (bucket.num.actual) so lake writers
-            // can stamp per-partition bucket layouts correctly after an ALTER bucket.num. The
-            // value of an existing partition never changes, so a per-table snapshot is safe.
+            // can stamp per-partition bucket layouts correctly after an ALTER bucket.num.
             if (currentTableInfo.isPartitioned()) {
                 try {
                     // the admin is a shared per-connection instance, so it must not be closed here

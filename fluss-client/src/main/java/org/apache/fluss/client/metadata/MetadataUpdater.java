@@ -174,8 +174,10 @@ public class MetadataUpdater {
     }
 
     /**
-     * Checks that the partition exists in the metadata cache and refreshes the cache if absent;
-     * throws if the partition does not exist on the server.
+     * Check the partition exists in metadata cache, if not, try to update the metadata cache, if
+     * not exist yet, throw exception.
+     *
+     * <p>and update partition metadata .
      */
     public boolean checkAndUpdatePartitionMetadata(PhysicalTablePath physicalTablePath)
             throws PartitionNotExistException {

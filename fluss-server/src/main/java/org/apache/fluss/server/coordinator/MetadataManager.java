@@ -542,7 +542,6 @@ public class MetadataManager {
         }
     }
 
-    /** Alters table properties and invokes the callbacks around the metadata update. */
     private void propagateBucketCountToLake(
             TablePath tablePath,
             TableInfo tableInfo,
@@ -625,6 +624,7 @@ public class MetadataManager {
         }
     }
 
+    /** Alters table properties and invokes the callbacks around the metadata update. */
     public void alterTableProperties(
             TablePath tablePath,
             List<TableChange> tableChanges,
