@@ -221,7 +221,7 @@ class LookupSender implements Runnable {
             LookupBatchKey batchKey = new LookupBatchKey(tb, lookup.originalPartitionName());
             lookupByTableId
                     .computeIfAbsent(tableId, k -> new LinkedHashMap<>())
-                    .computeIfAbsent(batchKey, k -> new LookupBatch(batchKey))
+                    .computeIfAbsent(batchKey, k -> new LookupBatch(batchKey, lookup.bucketCount()))
                     .addLookup(lookup);
         }
 
@@ -253,8 +253,7 @@ class LookupSender implements Runnable {
                                         lookupsByBatchKeyInRequest.values(),
                                         insertIfNotExists,
                                         acks,
-                                        maxRequestTimeoutMs,
-                                        metadataUpdater.getCluster()),
+                                        maxRequestTimeoutMs),
                                 tableId,
                                 lookupsByBatchKeyInRequest);
                     }
@@ -300,7 +299,7 @@ class LookupSender implements Runnable {
             long tableId = tb.getTableId();
             lookupByTableId
                     .computeIfAbsent(tableId, k -> new HashMap<>())
-                    .computeIfAbsent(tb, k -> new PrefixLookupBatch(tb))
+                    .computeIfAbsent(tb, k -> new PrefixLookupBatch(tb, prefixLookup.bucketCount()))
                     .addLookup(prefixLookup);
         }
 
@@ -323,10 +322,7 @@ class LookupSender implements Runnable {
                         sendPrefixLookupRequestAndHandleResponse(
                                 destination,
                                 gateway,
-                                makePrefixLookupRequest(
-                                        tableId,
-                                        prefixLookupBatch.values(),
-                                        metadataUpdater.getCluster()),
+                                makePrefixLookupRequest(tableId, prefixLookupBatch.values()),
                                 tableId,
                                 prefixLookupBatch));
     }

@@ -159,7 +159,13 @@ class PrimaryKeyLookuper extends AbstractLookuper implements Lookuper {
             bucketId = bucketingFunction.bucketing(bkBytes, effectiveNumBuckets);
         }
         TableBucket tableBucket = new TableBucket(tableInfo.getTableId(), partitionId, bucketId);
-        return lookupBucket(tableBucket, pkBytes, insertIfNotExists, false, originalPartitionName);
+        return lookupBucket(
+                tableBucket,
+                pkBytes,
+                insertIfNotExists,
+                false,
+                originalPartitionName,
+                effectiveNumBuckets);
     }
 
     /**
@@ -206,7 +212,8 @@ class PrimaryKeyLookuper extends AbstractLookuper implements Lookuper {
                     metadataUpdater.getPartitionIdOrElseThrow(historicalPartitionPath);
             TableBucket tableBucket =
                     new TableBucket(tableInfo.getTableId(), historicalPartitionId, bucketId);
-            return lookupBucket(tableBucket, keyBytes, false, true, originalPartitionName);
+            return lookupBucket(
+                    tableBucket, keyBytes, false, true, originalPartitionName, numBuckets);
         } catch (Throwable t) {
             return completedExceptionally(t);
         }
@@ -217,7 +224,8 @@ class PrimaryKeyLookuper extends AbstractLookuper implements Lookuper {
             byte[] keyBytes,
             boolean insertIfNotExists,
             boolean historicalLookup,
-            @Nullable String originalPartitionName) {
+            @Nullable String originalPartitionName,
+            int bucketCount) {
         CompletableFuture<LookupResult> lookupFuture = new CompletableFuture<>();
         lookupClient
                 .lookup(
@@ -225,7 +233,8 @@ class PrimaryKeyLookuper extends AbstractLookuper implements Lookuper {
                         tableBucket,
                         keyBytes,
                         insertIfNotExists,
-                        historicalLookup ? originalPartitionName : null)
+                        historicalLookup ? originalPartitionName : null,
+                        bucketCount)
                 .whenComplete(
                         (result, error) -> {
                             if (error != null) {

@@ -215,8 +215,7 @@ public class ClientRpcMessageUtils {
             Collection<LookupBatch> lookupBatches,
             boolean insertIfNotExists,
             short acks,
-            int timeoutMs,
-            Cluster cluster) {
+            int timeoutMs) {
         LookupRequest request = new LookupRequest().setTableId(tableId);
         if (insertIfNotExists) {
             request.setInsertIfNotExists(true);
@@ -230,12 +229,11 @@ public class ClientRpcMessageUtils {
                             request.addBucketsReq().setBucketId(tb.getBucket());
                     if (tb.getPartitionId() != null) {
                         pbLookupReqForBucket.setPartitionId(tb.getPartitionId());
-                        cluster.getBucketCount(
-                                        new TablePartition(tb.getTableId(), tb.getPartitionId()))
-                                .ifPresent(pbLookupReqForBucket::setBucketCount);
-                    } else {
-                        cluster.getBucketCountForTable(tb.getTableId())
-                                .ifPresent(pbLookupReqForBucket::setBucketCount);
+                    }
+                    // Carry the bucket count the bucketId was calculated with so the server can
+                    // validate it; 0 means unknown (legacy) and leaves the field unset.
+                    if (batch.getBucketCount() > 0) {
+                        pbLookupReqForBucket.setBucketCount(batch.getBucketCount());
                     }
                     if (batch.originalPartitionName() != null) {
                         pbLookupReqForBucket.setOriginalPartitionName(
@@ -247,7 +245,7 @@ public class ClientRpcMessageUtils {
     }
 
     public static PrefixLookupRequest makePrefixLookupRequest(
-            long tableId, Collection<PrefixLookupBatch> lookupBatches, Cluster cluster) {
+            long tableId, Collection<PrefixLookupBatch> lookupBatches) {
         PrefixLookupRequest request = new PrefixLookupRequest().setTableId(tableId);
         lookupBatches.forEach(
                 (batch) -> {
@@ -256,12 +254,11 @@ public class ClientRpcMessageUtils {
                             request.addBucketsReq().setBucketId(tb.getBucket());
                     if (tb.getPartitionId() != null) {
                         pbPrefixLookupReqForBucket.setPartitionId(tb.getPartitionId());
-                        cluster.getBucketCount(
-                                        new TablePartition(tb.getTableId(), tb.getPartitionId()))
-                                .ifPresent(pbPrefixLookupReqForBucket::setBucketCount);
-                    } else {
-                        cluster.getBucketCountForTable(tb.getTableId())
-                                .ifPresent(pbPrefixLookupReqForBucket::setBucketCount);
+                    }
+                    // Carry the bucket count the bucketId was calculated with so the server can
+                    // validate it; 0 means unknown (legacy) and leaves the field unset.
+                    if (batch.getBucketCount() > 0) {
+                        pbPrefixLookupReqForBucket.setBucketCount(batch.getBucketCount());
                     }
                     batch.lookups().forEach(get -> pbPrefixLookupReqForBucket.addKey(get.key()));
                 });
