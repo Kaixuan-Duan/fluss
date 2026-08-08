@@ -39,7 +39,6 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -58,12 +57,15 @@ import static org.mockito.Mockito.when;
  */
 class LakeSplitGeneratorTest {
 
-    @Test
+    /**
+     * Builds a {@link LakeSplitGenerator} for a partitioned primary-key table (schema: a INT, b
+     * STRING, c STRING; PK a+c) whose single partition "p" has {@code partitionBucketCount}
+     * enumerated buckets and a single lake split landing in {@code lakeSplitBucket}.
+     */
     @SuppressWarnings("unchecked")
-    void testPrimaryKeyOutOfRangeLakeBucketFailsLoud() throws Exception {
-        TablePath tablePath = TablePath.of("db", "pk_rescale");
-        // partitioned primary-key table; table-level bucket count is 2
-        int partitionBucketCount = 2;
+    private static LakeSplitGenerator createGenerator(int partitionBucketCount, int lakeSplitBucket)
+            throws Exception {
+        TablePath tablePath = TablePath.of("db", "pk_table");
         TableDescriptor descriptor =
                 TableDescriptor.builder()
                         .schema(
@@ -78,81 +80,12 @@ class LakeSplitGeneratorTest {
                         .build();
         TableInfo tableInfo = TableInfo.of(tablePath, 1L, 1, descriptor, null, 1L, 1L);
 
-        // a lake split for partition "p" landing in bucket 5, which is outside [0, 2)
-        LakeSplit outOfRangeSplit = mock(LakeSplit.class);
-        when(outOfRangeSplit.partition()).thenReturn(Collections.singletonList("p"));
-        when(outOfRangeSplit.bucket()).thenReturn(5);
+        LakeSplit lakeSplit = mock(LakeSplit.class);
+        when(lakeSplit.partition()).thenReturn(Collections.singletonList("p"));
+        when(lakeSplit.bucket()).thenReturn(lakeSplitBucket);
 
         Planner<LakeSplit> planner = mock(Planner.class);
-        when(planner.plan()).thenReturn(Collections.singletonList(outOfRangeSplit));
-        LakeSource<LakeSplit> lakeSource = mock(LakeSource.class);
-        when(lakeSource.createPlanner(any())).thenReturn(planner);
-
-        Admin admin = mock(Admin.class);
-        when(admin.getReadableLakeSnapshot(tablePath))
-                .thenReturn(
-                        CompletableFuture.completedFuture(new LakeSnapshot(1L, new HashMap<>())));
-
-        OffsetsInitializer.BucketOffsetsRetriever retriever =
-                mock(OffsetsInitializer.BucketOffsetsRetriever.class);
-        OffsetsInitializer stoppingOffsetInitializer = mock(OffsetsInitializer.class);
-        Map<Integer, Long> stoppingOffsets = new HashMap<>();
-        stoppingOffsets.put(0, 0L);
-        stoppingOffsets.put(1, 0L);
-        when(stoppingOffsetInitializer.getBucketOffsets(eq("p"), anyList(), any()))
-                .thenReturn(stoppingOffsets);
-
-        // the partition "p" carries its own bucket count of 2 (so bucket 5 is out of range)
-        PartitionInfo partitionInfo =
-                new PartitionInfo(
-                        7L,
-                        ResolvedPartitionSpec.fromPartitionName(tableInfo.getPartitionKeys(), "p"),
-                        null,
-                        partitionBucketCount);
-        Set<PartitionInfo> partitions = Collections.singleton(partitionInfo);
-
-        LakeSplitGenerator generator =
-                new LakeSplitGenerator(
-                        tableInfo,
-                        admin,
-                        lakeSource,
-                        retriever,
-                        stoppingOffsetInitializer,
-                        partitionBucketCount,
-                        () -> partitions);
-
-        assertThatThrownBy(generator::generateHybridLakeFlussSplits)
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("outside the enumerated range")
-                .hasMessageContaining("refusing to generate union-read splits");
-    }
-
-    @Test
-    @SuppressWarnings("unchecked")
-    void testPrimaryKeyInRangeLakeBucketSucceeds() throws Exception {
-        TablePath tablePath = TablePath.of("db", "pk_ok");
-        int partitionBucketCount = 4;
-        TableDescriptor descriptor =
-                TableDescriptor.builder()
-                        .schema(
-                                Schema.newBuilder()
-                                        .column("a", DataTypes.INT())
-                                        .column("b", DataTypes.STRING())
-                                        .column("c", DataTypes.STRING())
-                                        .primaryKey("a", "c")
-                                        .build())
-                        .distributedBy(partitionBucketCount, "a")
-                        .partitionedBy("c")
-                        .build();
-        TableInfo tableInfo = TableInfo.of(tablePath, 1L, 1, descriptor, null, 1L, 1L);
-
-        // an in-range lake split (bucket 1 within [0, 4))
-        LakeSplit inRangeSplit = mock(LakeSplit.class);
-        when(inRangeSplit.partition()).thenReturn(Collections.singletonList("p"));
-        when(inRangeSplit.bucket()).thenReturn(1);
-
-        Planner<LakeSplit> planner = mock(Planner.class);
-        when(planner.plan()).thenReturn(Collections.singletonList(inRangeSplit));
+        when(planner.plan()).thenReturn(Collections.singletonList(lakeSplit));
         LakeSource<LakeSplit> lakeSource = mock(LakeSource.class);
         when(lakeSource.createPlanner(any())).thenReturn(planner);
 
@@ -171,6 +104,8 @@ class LakeSplitGeneratorTest {
         when(stoppingOffsetInitializer.getBucketOffsets(eq("p"), anyList(), any()))
                 .thenReturn(stoppingOffsets);
 
+        // the partition "p" carries its own bucket count (so an out-of-range lake bucket can be
+        // detected against the enumerated range [0, partitionBucketCount))
         PartitionInfo partitionInfo =
                 new PartitionInfo(
                         7L,
@@ -178,15 +113,31 @@ class LakeSplitGeneratorTest {
                         null,
                         partitionBucketCount);
 
-        LakeSplitGenerator generator =
-                new LakeSplitGenerator(
-                        tableInfo,
-                        admin,
-                        lakeSource,
-                        retriever,
-                        stoppingOffsetInitializer,
-                        partitionBucketCount,
-                        () -> Collections.singleton(partitionInfo));
+        return new LakeSplitGenerator(
+                tableInfo,
+                admin,
+                lakeSource,
+                retriever,
+                stoppingOffsetInitializer,
+                partitionBucketCount,
+                () -> Collections.singleton(partitionInfo));
+    }
+
+    @Test
+    void testPrimaryKeyOutOfRangeLakeBucketFailsLoud() throws Exception {
+        // lake split lands in bucket 5, which is outside [0, 2)
+        LakeSplitGenerator generator = createGenerator(2, 5);
+        assertThatThrownBy(generator::generateHybridLakeFlussSplits)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("outside the enumerated range")
+                .hasMessageContaining("refusing to generate union-read splits");
+    }
+
+    @Test
+    void testPrimaryKeyInRangeLakeBucketSucceeds() throws Exception {
+        // lake split lands in bucket 1, which is within [0, 4)
+        int partitionBucketCount = 4;
+        LakeSplitGenerator generator = createGenerator(partitionBucketCount, 1);
 
         // no out-of-range bucket: generation succeeds and produces one hybrid lake+log split per
         // bucket of the partition's enumerated range [0, partitionBucketCount)

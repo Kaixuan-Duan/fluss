@@ -144,18 +144,20 @@ class PartitionBucketCountRescaleITCase extends ClientToServerITCaseBase {
     }
 
     @Test
-    void testPkTableLookupAcrossPartitionsWithDifferentBucketCounts() throws Exception {
-        TablePath tablePath = TablePath.of("test_db_1", "test_rescale_pk_table");
+    void testPkTableReadPathsAcrossRescale() throws Exception {
+        TablePath tablePath = TablePath.of("test_db_1", "test_rescale_pk_read_paths");
         Schema schema = pkSchema("a", "c");
         createPartitionedTable(tablePath, schema);
-        setupOldNewPartitions(tablePath);
+        List<PartitionInfo> partitionInfos = setupOldNewPartitions(tablePath);
+        Map<String, Long> idByName = partitionIdByName(partitionInfos);
+        Map<String, Integer> bucketCountByName = bucketCountByName(partitionInfos);
 
-        // upsert to both partitions
         Table table = conn.getTable(tablePath);
+        long tableId = table.getTableInfo().getTableId();
         upsertRowsToOldAndNew(table);
 
-        // lookup every key in both partitions: write routing N must equal lookup routing N per
-        // partition, otherwise the lookup would hit the wrong bucket and miss the row.
+        // 1. Lookup: write routing N must equal lookup routing N per partition, otherwise the
+        // lookup would hit the wrong bucket and miss the row.
         Lookuper lookuper = table.newLookup().createLookuper();
         for (String partitionName : OLD_NEW_PARTITIONS) {
             for (int j = 0; j < RECORDS_PER_PARTITION; j++) {
@@ -164,6 +166,59 @@ class PartitionBucketCountRescaleITCase extends ClientToServerITCaseBase {
                 assertThatRow(looked).withSchema(schema.getRowType()).isEqualTo(expected);
             }
         }
+
+        // 2. PK stream read: LogScanner subscribes by per-partition bucket count. Each partition's
+        // total polled records must equal the writes; if routing used the wrong count, the
+        // subscribed bucket range would miss rows.
+        Map<TableBucket, Integer> perBucketCount =
+                pollRecordCountPerBucket(table, partitionInfos, 2 * RECORDS_PER_PARTITION);
+        Map<Long, Integer> streamCountsPerPartition = new HashMap<>();
+        perBucketCount.forEach(
+                (tb, c) -> streamCountsPerPartition.merge(tb.getPartitionId(), c, Integer::sum));
+        for (String partitionName : OLD_NEW_PARTITIONS) {
+            assertThat(streamCountsPerPartition.get(idByName.get(partitionName)))
+                    .as("PK stream count for partition %s", partitionName)
+                    .isEqualTo(RECORDS_PER_PARTITION);
+        }
+
+        // 3. Batch read: for each partition, trigger a KV snapshot on every bucket, then scan back
+        // per (partition, bucket) with BatchScanner using the partition's own bucket count.
+        for (String partitionName : OLD_NEW_PARTITIONS) {
+            long partitionId = idByName.get(partitionName);
+            int bucketCount = bucketCountByName.get(partitionName);
+            int partitionSum = 0;
+            for (int bucketId = 0; bucketId < bucketCount; bucketId++) {
+                TableBucket tb = new TableBucket(tableId, partitionId, bucketId);
+                long snapshotId =
+                        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb).getSnapshotID();
+                try (BatchScanner batchScanner =
+                        table.newScan().createBatchScanner(tb, snapshotId)) {
+                    while (true) {
+                        CloseableIterator<InternalRow> it =
+                                batchScanner.pollBatch(Duration.ofSeconds(10));
+                        if (it == null) {
+                            break;
+                        }
+                        try {
+                            while (it.hasNext()) {
+                                it.next();
+                                partitionSum++;
+                            }
+                        } finally {
+                            it.close();
+                        }
+                    }
+                }
+            }
+            assertThat(partitionSum)
+                    .as("PK batch count for partition %s", partitionName)
+                    .isEqualTo(RECORDS_PER_PARTITION);
+        }
+
+        // 4. count(*) must use each partition's own bucket count, not the table-level count
+        // (which would enumerate out-of-range buckets for old partitions and skew the total).
+        assertThat(admin.getTableStats(tablePath).get().getRowCount())
+                .isEqualTo(2L * RECORDS_PER_PARTITION);
     }
 
     @Test
@@ -247,80 +302,9 @@ class PartitionBucketCountRescaleITCase extends ClientToServerITCaseBase {
     }
 
     @Test
-    void testPkTableStreamReadAndBatchScanAcrossPartitions() throws Exception {
-        // PK stream read + batch read: old/new partitions are each subscribed by LogScanner and
-        // scanned per bucket via BatchScanner using their own per-partition bucket count. The
-        // total reads per partition must equal the writes; if routing used the wrong count, the
-        // real subscribed/scanned bucket range would miss rows.
-        TablePath tablePath = TablePath.of("test_db_1", "test_rescale_pk_stream_batch");
-        Schema schema = pkSchema("a", "c");
-        createPartitionedTable(tablePath, schema);
-        List<PartitionInfo> partitionInfos = setupOldNewPartitions(tablePath);
-        Map<String, Long> idByName = partitionIdByName(partitionInfos);
-        Map<String, Integer> bucketCountByName = bucketCountByName(partitionInfos);
-
-        Table table = conn.getTable(tablePath);
-        long tableId = table.getTableInfo().getTableId();
-        upsertRowsToOldAndNew(table);
-
-        // PK stream read: LogScanner subscribes by per-partition bucket count.
-        Map<TableBucket, Integer> perBucketCount =
-                pollRecordCountPerBucket(table, partitionInfos, 2 * RECORDS_PER_PARTITION);
-        Map<Long, Integer> streamCountsPerPartition = new HashMap<>();
-        perBucketCount.forEach(
-                (tb, c) -> streamCountsPerPartition.merge(tb.getPartitionId(), c, Integer::sum));
-        for (String partitionName : OLD_NEW_PARTITIONS) {
-            assertThat(streamCountsPerPartition.get(idByName.get(partitionName)))
-                    .as("PK stream count for partition %s", partitionName)
-                    .isEqualTo(RECORDS_PER_PARTITION);
-        }
-
-        // Batch read: for each partition, trigger a KV snapshot on every bucket, then scan back
-        // per (partition, bucket) with BatchScanner.
-        Map<String, Integer> batchCountsPerPartition = new HashMap<>();
-        for (String partitionName : OLD_NEW_PARTITIONS) {
-            long partitionId = idByName.get(partitionName);
-            int bucketCount = bucketCountByName.get(partitionName);
-            int partitionSum = 0;
-            for (int bucketId = 0; bucketId < bucketCount; bucketId++) {
-                TableBucket tb = new TableBucket(tableId, partitionId, bucketId);
-                long snapshotId =
-                        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb).getSnapshotID();
-                try (BatchScanner batchScanner =
-                        table.newScan().createBatchScanner(tb, snapshotId)) {
-                    while (true) {
-                        CloseableIterator<InternalRow> it =
-                                batchScanner.pollBatch(Duration.ofSeconds(10));
-                        if (it == null) {
-                            break;
-                        }
-                        try {
-                            while (it.hasNext()) {
-                                it.next();
-                                partitionSum++;
-                            }
-                        } finally {
-                            it.close();
-                        }
-                    }
-                }
-            }
-            batchCountsPerPartition.put(partitionName, partitionSum);
-        }
-        for (String partitionName : OLD_NEW_PARTITIONS) {
-            assertThat(batchCountsPerPartition.get(partitionName))
-                    .as("PK batch count for partition %s", partitionName)
-                    .isEqualTo(RECORDS_PER_PARTITION);
-        }
-    }
-
-    @Test
     void testPrefixLookupAcrossPartitionsWithDifferentBucketCounts() throws Exception {
-        // Prefix lookup routing: PK=(a,b,c), partitionedBy=c, bucket.key=a. Each (a, c) prefix
-        // must locate the correct bucket in the correct partition. Writing multiple `b` values
-        // for the same (a, c) verifies the prefix returns them all; if prefix lookuper resolves
-        // the bucket with a mismatched partition-level count it would query the wrong bucket
-        // and miss rows.
+        // Prefix lookup must resolve the bucket with the correct per-partition count; a mismatch
+        // would query the wrong bucket and miss rows.
         TablePath tablePath = TablePath.of("test_db_1", "test_rescale_prefix_lookup");
         Schema schema = pkSchema("a", "b", "c");
         createPartitionedTable(tablePath, schema, "a");
@@ -350,23 +334,6 @@ class PartitionBucketCountRescaleITCase extends ClientToServerITCaseBase {
                         .hasSize(bPerA);
             }
         }
-    }
-
-    @Test
-    void testCountAcrossPartitionsWithDifferentBucketCounts() throws Exception {
-        // count(*) via getTableStats sums rows across all partitions. On the server side this
-        // reaches resolveNumBuckets which must use each partition's own assignment size; if it
-        // used the table-level count for the old partition (post-ALTER == 4) it would enumerate
-        // out-of-range buckets and skew the aggregation.
-        TablePath tablePath = TablePath.of("test_db_1", "test_rescale_count");
-        createPartitionedTable(tablePath, pkSchema("a", "c"));
-        setupOldNewPartitions(tablePath);
-
-        Table table = conn.getTable(tablePath);
-        upsertRowsToOldAndNew(table);
-
-        assertThat(admin.getTableStats(tablePath).get().getRowCount())
-                .isEqualTo(2L * RECORDS_PER_PARTITION);
     }
 
     // ==================== helpers ====================
