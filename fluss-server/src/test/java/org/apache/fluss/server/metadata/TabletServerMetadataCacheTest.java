@@ -26,6 +26,7 @@ import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
 
@@ -667,6 +668,147 @@ public class TabletServerMetadataCacheTest {
         assertThat(serverMetadataCache.getTableMetadata(partitionedTablePath)).isEmpty();
         assertThat(serverMetadataCache.getPhysicalTablePath(partitionId)).isEmpty();
         assertThat(serverMetadataCache.getPartitionMetadata(partitionPath)).isEmpty();
+    }
+
+    @Test
+    void testValidateBucketCountForNonPartitionedTable() {
+        // epoch=0 (never ALTERed), 2 buckets in cache
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        coordinatorServer,
+                        aliveTableServers,
+                        Collections.singletonList(
+                                new TableMetadata(DATA1_TABLE_INFO, initialBucketMetadata)),
+                        Collections.emptyList()));
+        int actualCount = initialBucketMetadata.size();
+
+        // legacy client (bucketCount=0) + epoch=0 → allow
+        assertThat(serverMetadataCache.validateBucketCount(DATA1_TABLE_ID, null, 0))
+                .isEqualTo(Errors.NONE);
+        // correct count → allow
+        assertThat(serverMetadataCache.validateBucketCount(DATA1_TABLE_ID, null, actualCount))
+                .isEqualTo(Errors.NONE);
+        // wrong count → reject
+        assertThat(serverMetadataCache.validateBucketCount(DATA1_TABLE_ID, null, actualCount + 1))
+                .isEqualTo(Errors.STALE_METADATA);
+    }
+
+    @Test
+    void testValidateBucketCountRejectsLegacyClientAfterAlter() {
+        // epoch=1 (ALTERed), still 2 buckets in cache
+        TableInfo alteredTableInfo =
+                TableInfo.of(
+                        DATA1_TABLE_PATH,
+                        DATA1_TABLE_ID,
+                        1,
+                        DATA1_TABLE_DESCRIPTOR,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        100L,
+                        100L,
+                        1L);
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        coordinatorServer,
+                        aliveTableServers,
+                        Collections.singletonList(
+                                new TableMetadata(alteredTableInfo, initialBucketMetadata)),
+                        Collections.emptyList()));
+        int actualCount = initialBucketMetadata.size();
+
+        // legacy client (bucketCount=0) + epoch>0 → reject
+        assertThat(serverMetadataCache.validateBucketCount(DATA1_TABLE_ID, null, 0))
+                .isEqualTo(Errors.STALE_METADATA);
+        // correct count → allow
+        assertThat(serverMetadataCache.validateBucketCount(DATA1_TABLE_ID, null, actualCount))
+                .isEqualTo(Errors.NONE);
+        // wrong count → reject
+        assertThat(serverMetadataCache.validateBucketCount(DATA1_TABLE_ID, null, actualCount + 1))
+                .isEqualTo(Errors.STALE_METADATA);
+    }
+
+    @Test
+    void testValidateBucketCountForPartitionedTable() {
+        // partitioned table with epoch=0, explicit per-partition bucket count=8
+        int explicitBucketCount = 8;
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        coordinatorServer,
+                        aliveTableServers,
+                        tableMetadataList,
+                        Collections.singletonList(
+                                new PartitionMetadata(
+                                        partitionTableId,
+                                        partitionName1,
+                                        partitionId1,
+                                        initialBucketMetadata,
+                                        explicitBucketCount))));
+
+        // epoch=0, legacy client (bucketCount=0) → allow
+        assertThat(serverMetadataCache.validateBucketCount(partitionTableId, partitionId1, 0))
+                .isEqualTo(Errors.NONE);
+        // correct explicit count → allow
+        assertThat(
+                        serverMetadataCache.validateBucketCount(
+                                partitionTableId, partitionId1, explicitBucketCount))
+                .isEqualTo(Errors.NONE);
+        // wrong count → reject
+        assertThat(
+                        serverMetadataCache.validateBucketCount(
+                                partitionTableId, partitionId1, explicitBucketCount + 1))
+                .isEqualTo(Errors.STALE_METADATA);
+    }
+
+    @Test
+    void testValidateBucketCountForPartitionedTableAfterAlter() {
+        // partitioned table with epoch=2 (ALTERed), explicit per-partition bucket count=8
+        int explicitBucketCount = 8;
+        TableInfo alteredPartitionTableInfo =
+                TableInfo.of(
+                        partitionedTablePath,
+                        partitionTableId,
+                        0,
+                        DATA1_PARTITIONED_TABLE_DESCRIPTOR,
+                        DEFAULT_REMOTE_DATA_DIR,
+                        100L,
+                        100L,
+                        2L);
+        serverMetadataCache.updateClusterMetadata(
+                new ClusterMetadata(
+                        coordinatorServer,
+                        aliveTableServers,
+                        Collections.singletonList(
+                                new TableMetadata(
+                                        alteredPartitionTableInfo, initialBucketMetadata)),
+                        Collections.singletonList(
+                                new PartitionMetadata(
+                                        partitionTableId,
+                                        partitionName1,
+                                        partitionId1,
+                                        initialBucketMetadata,
+                                        explicitBucketCount))));
+
+        // epoch>0, legacy client (bucketCount=0) → reject
+        assertThat(serverMetadataCache.validateBucketCount(partitionTableId, partitionId1, 0))
+                .isEqualTo(Errors.STALE_METADATA);
+        // correct explicit count → allow
+        assertThat(
+                        serverMetadataCache.validateBucketCount(
+                                partitionTableId, partitionId1, explicitBucketCount))
+                .isEqualTo(Errors.NONE);
+        // wrong count → reject
+        assertThat(
+                        serverMetadataCache.validateBucketCount(
+                                partitionTableId, partitionId1, explicitBucketCount + 1))
+                .isEqualTo(Errors.STALE_METADATA);
+    }
+
+    @Test
+    void testValidateBucketCountBeforeInitialMetadataApplied() {
+        // no updateClusterMetadata called yet → initialMetadataApplied=false
+        assertThat(serverMetadataCache.validateBucketCount(DATA1_TABLE_ID, null, 3))
+                .isEqualTo(Errors.STALE_METADATA);
+        assertThat(serverMetadataCache.validateBucketCount(DATA1_TABLE_ID, null, 0))
+                .isEqualTo(Errors.STALE_METADATA);
     }
 
     private static final class TestingMetadataManager extends MetadataManager {
