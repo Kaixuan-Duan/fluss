@@ -396,6 +396,17 @@ public class TabletServerMetadataCache implements ServerMetadataCache {
                     // Get current snapshot
                     ServerMetadataSnapshot currentSnapshot = serverMetadataSnapshot;
 
+                    // Ignore an older UpdateMetadata for this table to prevent it from
+                    // overwriting newer state when messages arrive out of order.
+                    long newEpoch = tableInfo.getBucketLayoutEpoch();
+                    long currentEpoch =
+                            currentSnapshot
+                                    .getBucketLayoutEpochByTableId()
+                                    .getOrDefault(tableId, 0L);
+                    if (newEpoch < currentEpoch) {
+                        return;
+                    }
+
                     // Create new maps based on current state
                     Map<TablePath, Long> tableIdByPath =
                             new HashMap<>(currentSnapshot.getTableIdByPath());
