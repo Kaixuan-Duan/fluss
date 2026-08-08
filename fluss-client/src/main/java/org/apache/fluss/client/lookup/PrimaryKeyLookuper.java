@@ -201,6 +201,22 @@ class PrimaryKeyLookuper extends AbstractLookuper implements Lookuper {
                     new UnsupportedOperationException(
                             "Lookup with insertIfNotExists is not supported for historical partition lookup."));
         }
+        // TODO: Support historical lookup on rescaled tables. The lake data of the original
+        //  partition is laid out with the bucket count that partition was tiered with, but that
+        //  partition is already dropped from Fluss, so neither the table-level count nor the
+        //  historical partition's own count is guaranteed to match it. Only the lake metadata
+        //  still knows it (Paimon exposes it as DataSplit#totalBuckets), so the server has to
+        //  resolve it and route to the bucket itself. Until then, reject the lookup instead of
+        //  silently reading the wrong bucket.
+        if (tableInfo.getBucketLayoutEpoch() > 0) {
+            return completedExceptionally(
+                    new UnsupportedOperationException(
+                            String.format(
+                                    "Historical partition lookup is not supported on table %s because its "
+                                            + "'bucket.num' has been altered, so the bucket layout of already "
+                                            + "tiered partitions can no longer be determined by the client.",
+                                    tableInfo.getTablePath())));
+        }
         PhysicalTablePath historicalPartitionPath =
                 PhysicalTablePath.of(tableInfo.getTablePath(), HISTORICAL_PARTITION_VALUE);
         try {
