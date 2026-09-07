@@ -213,6 +213,11 @@ public class LazyMemorySegmentPool implements MemorySegmentPool, Closeable {
     }
 
     @Override
+    public int totalPages() {
+        return maxPages;
+    }
+
+    @Override
     public void returnPage(MemorySegment segment) {
         returnAll(Collections.singletonList(segment));
     }

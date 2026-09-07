@@ -20,8 +20,11 @@ package org.apache.fluss.server.kv;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.exception.DeletionDisabledException;
+import org.apache.fluss.exception.MemoryPoolTimeoutException;
 import org.apache.fluss.exception.SchemaNotExistException;
+import org.apache.fluss.exception.WalRecordBatchTooLargeException;
 import org.apache.fluss.memory.MemorySegmentPool;
+import org.apache.fluss.memory.MemorySegmentPoolExhaustedException;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
@@ -66,6 +69,7 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
+import java.io.EOFException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -162,16 +166,18 @@ public final class KvWriteProcessor {
             throws Exception {
         WriteContext writeContext = createWriteContext(kvRecords, targetColumns, mergeMode);
         RowType latestRowType = writeContext.latestSchema.getRowType();
-        WalBuilder walBuilder = createWalBuilder(writeContext.latestSchemaId, latestRowType);
-        walBuilder.setWriterState(kvRecords.writerId(), kvRecords.batchSequence());
-        // we only support ADD COLUMN LAST, so the BinaryRow after RowMerger is
-        // only has fewer ending columns than latest schema, so we pad nulls to
-        // the end of the BinaryRow to get the latest schema row.
-        PaddingRow latestSchemaRow = new PaddingRow(latestRowType.getFieldCount());
         // get offset to track the offset corresponded to the kv record
         long logEndOffsetOfPrevBatch = logTablet.localLogEndOffset();
 
+        WalBuilder walBuilder = null;
         try {
+            walBuilder = createWalBuilder(writeContext.latestSchemaId, latestRowType);
+            walBuilder.setWriterState(kvRecords.writerId(), kvRecords.batchSequence());
+            // we only support ADD COLUMN LAST, so the BinaryRow after RowMerger is
+            // only has fewer ending columns than latest schema, so we pad nulls to
+            // the end of the BinaryRow to get the latest schema row.
+            PaddingRow latestSchemaRow = new PaddingRow(latestRowType.getFieldCount());
+
             if (rowTtlTimestampProvider != null) {
                 rowTtlTimestampProvider.prepareForBatch(clock.milliseconds());
             }
@@ -205,6 +211,32 @@ public final class KvWriteProcessor {
                 stateAccessor.truncateTo(logEndOffsetOfPrevBatch, TruncateReason.DUPLICATED);
             }
             return logAppendInfo;
+        } catch (EOFException e) {
+            // The shared memory pool timed out handing pages to the WAL builder. The batch
+            // holds only part of the pool in this case, so a retry may succeed once other
+            // in-flight batches release their pages: surface a retriable error. The raw
+            // EOFException must not escape: it would be routed to the fatal error handler
+            // and shut down the whole tablet server.
+            stateAccessor.truncateTo(logEndOffsetOfPrevBatch, TruncateReason.ERROR);
+            throw new MemoryPoolTimeoutException(
+                    String.format(
+                            "Timed out waiting for memory to generate the WAL for %s: the shared "
+                                    + "memory pool is exhausted by concurrent write batches. "
+                                    + "Consider increasing server.buffer.memory-size.",
+                            tableBucket),
+                    e);
+        } catch (MemorySegmentPoolExhaustedException e) {
+            // The WAL batch already holds every page of the pool and needs one more: it can
+            // never complete, and neither can a retry of the same batch, so fail fast with
+            // actionable guidance instead of waiting (and retrying) forever.
+            stateAccessor.truncateTo(logEndOffsetOfPrevBatch, TruncateReason.ERROR);
+            throw new WalRecordBatchTooLargeException(
+                    String.format(
+                            "Failed to write %s: the WAL batch generated for this write batch "
+                                    + "requires more memory than the server shared memory pool. "
+                                    + "Consider reducing client.writer.batch-size or increasing "
+                                    + "server.buffer.memory-size. Underlying reason: %s",
+                            tableBucket, e.getMessage()));
         } catch (Throwable t) {
             // While encounter error here, the CDC logs may fail writing to disk,
             // and the client probably will resend the batch. If we do not remove the
@@ -216,7 +248,9 @@ public final class KvWriteProcessor {
             throw t;
         } finally {
             // deallocate the memory and arrow writer used by the wal builder
-            walBuilder.deallocate();
+            if (walBuilder != null) {
+                walBuilder.deallocate();
+            }
         }
     }
 

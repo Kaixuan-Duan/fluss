@@ -18,9 +18,11 @@
 package org.apache.fluss.rpc.protocol;
 
 import org.apache.fluss.exception.HistoricalPartitionThrottledException;
+import org.apache.fluss.exception.MemoryPoolTimeoutException;
 import org.apache.fluss.exception.NotEnoughReplicasException;
 import org.apache.fluss.exception.TimeoutException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
+import org.apache.fluss.exception.WalRecordBatchTooLargeException;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -88,6 +90,20 @@ public class ApiErrorTest {
                                 historicalLookupThrottledErrorMsg),
                         Errors.HISTORICAL_PARTITION_THROTTLED,
                         historicalLookupThrottledErrorMsg));
+
+        String walBatchTooLargeErrorMsg = "wal batch too large";
+        arguments.add(
+                Arguments.of(
+                        new WalRecordBatchTooLargeException(walBatchTooLargeErrorMsg),
+                        Errors.WAL_RECORD_BATCH_TOO_LARGE_EXCEPTION,
+                        walBatchTooLargeErrorMsg));
+
+        String memoryPoolTimeoutErrorMsg = "memory pool timeout";
+        arguments.add(
+                Arguments.of(
+                        new MemoryPoolTimeoutException(memoryPoolTimeoutErrorMsg),
+                        Errors.MEMORY_POOL_TIMEOUT_EXCEPTION,
+                        memoryPoolTimeoutErrorMsg));
 
         return arguments;
     }

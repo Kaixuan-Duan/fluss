@@ -43,6 +43,17 @@ public interface MemorySegmentPool {
     long totalSize();
 
     /**
+     * Get the total number of pages this pool can hold, or {@link Integer#MAX_VALUE} if the pool is
+     * effectively unbounded. Bounded pools should override this so that writers backed by this pool
+     * can detect a request that can never be satisfied.
+     *
+     * @return the total page count, or {@link Integer#MAX_VALUE} if unbounded
+     */
+    default int totalPages() {
+        return Integer.MAX_VALUE;
+    }
+
+    /**
      * Gets the next memory segment. If no more segments are available, it returns null.
      *
      * @return The next memory segment, or null, if none is available.

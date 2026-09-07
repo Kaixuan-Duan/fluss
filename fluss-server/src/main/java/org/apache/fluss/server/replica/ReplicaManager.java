@@ -32,12 +32,14 @@ import org.apache.fluss.exception.InvalidRequiredAcksException;
 import org.apache.fluss.exception.KvStorageException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
+import org.apache.fluss.exception.MemoryPoolTimeoutException;
 import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.StorageBackpressureException;
 import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.exception.UnsupportedVersionException;
+import org.apache.fluss.exception.WalRecordBatchTooLargeException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -1997,7 +1999,9 @@ public class ReplicaManager implements ServerReconfigurable {
         return !(e instanceof UnknownTableOrBucketException
                 || e instanceof NotLeaderOrFollowerException
                 || e instanceof LogOffsetOutOfRangeException
-                || e instanceof StorageBackpressureException);
+                || e instanceof StorageBackpressureException
+                || e instanceof MemoryPoolTimeoutException
+                || e instanceof WalRecordBatchTooLargeException);
     }
 
     private boolean isUnexpectedHistoricalException(Exception e) {

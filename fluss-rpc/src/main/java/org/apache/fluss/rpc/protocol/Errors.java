@@ -57,6 +57,7 @@ import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.exception.LeaderNotAvailableException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
+import org.apache.fluss.exception.MemoryPoolTimeoutException;
 import org.apache.fluss.exception.NetworkException;
 import org.apache.fluss.exception.NoRebalanceInProgressException;
 import org.apache.fluss.exception.NonPrimaryKeyTableException;
@@ -92,6 +93,7 @@ import org.apache.fluss.exception.UnknownServerException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.exception.UnknownWriterIdException;
 import org.apache.fluss.exception.UnsupportedVersionException;
+import org.apache.fluss.exception.WalRecordBatchTooLargeException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -285,7 +287,18 @@ public enum Errors {
     HISTORICAL_PARTITION_THROTTLED(
             73,
             "Historical partition request is throttled because too many historical requests are in flight.",
-            HistoricalPartitionThrottledException::new);
+            HistoricalPartitionThrottledException::new),
+    WAL_RECORD_BATCH_TOO_LARGE_EXCEPTION(
+            74,
+            "The WAL batch generated for a primary-key write batch requires more memory than the "
+                    + "server shared memory pool can ever provide; retrying the same batch cannot "
+                    + "succeed.",
+            WalRecordBatchTooLargeException::new),
+    MEMORY_POOL_TIMEOUT_EXCEPTION(
+            75,
+            "Timed out waiting for pages from the server shared memory pool while generating the "
+                    + "WAL for a primary-key write batch.",
+            MemoryPoolTimeoutException::new);
 
     private static final Logger LOG = LoggerFactory.getLogger(Errors.class);
 

@@ -38,6 +38,18 @@ public class ManagedPagedOutputView extends AbstractPagedOutputView {
 
     @Override
     protected MemorySegment nextSegment() throws IOException {
+        // Fast-fail when this view already holds every page of the pool and needs one more: the
+        // pool returns pages only when the batch holding them completes, and that batch is this
+        // one, so waiting (or retrying later) can never succeed.
+        int totalPages = segmentPool.totalPages();
+        if (pooledSegments.size() >= totalPages) {
+            throw new MemorySegmentPoolExhaustedException(
+                    String.format(
+                            "The batch built by this output view already holds all %d pages "
+                                    + "(%d bytes in total) of the shared memory pool and needs "
+                                    + "one more page, so the batch can never complete.",
+                            totalPages, totalPages * segmentPool.pageSize()));
+        }
         MemorySegment segment = segmentPool.nextSegment();
         pooledSegments.add(segment);
         return segment;

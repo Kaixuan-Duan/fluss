@@ -813,7 +813,7 @@ public class ConfigOptions {
     public static final ConfigOption<Duration> SERVER_BUFFER_POOL_WAIT_TIMEOUT =
             key("server.buffer.wait-timeout")
                     .durationType()
-                    .defaultValue(Duration.ofNanos(Long.MAX_VALUE))
+                    .defaultValue(Duration.ofSeconds(60))
                     .withDescription(
                             "Defines how long the buffer pool will block when waiting for segments to become available.");
 
